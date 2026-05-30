@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-ai-bot"
+version = "0.1.0"
+description = "Push-to-talk OpenAI voice daemon for a Raspberry Pi AIY Voice HAT"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=2.0.0",
+  "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+voice-ai-bot = "voice_ai_bot.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
