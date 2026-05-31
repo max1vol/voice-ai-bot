@@ -68,3 +68,11 @@ class HatHardware:
             time.sleep(0.08)
             self.led.off()
             time.sleep(0.08)
+
+    def signal_error(self) -> None:
+        self.stop_blinking()
+        for _ in range(8):
+            self.led.on()
+            time.sleep(0.05)
+            self.led.off()
+            time.sleep(0.05)

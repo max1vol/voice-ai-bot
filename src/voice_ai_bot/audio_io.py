@@ -18,6 +18,7 @@ class Recorder:
         self.process: subprocess.Popen[bytes] | None = None
         self.path: Path | None = None
         self.started_at = 0.0
+        self.last_stderr = ""
 
     def start(self) -> Path:
         if self.process is not None:
@@ -53,7 +54,8 @@ class Recorder:
         path = self.path
         self.process = None
         self.path = None
-        process.send_signal(signal.SIGINT)
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
         try:
             _, stderr = process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
@@ -63,14 +65,24 @@ class Recorder:
             except subprocess.TimeoutExpired:
                 process.kill()
                 _, stderr = process.communicate(timeout=1)
+        self.last_stderr = stderr.decode(errors="replace").strip()
+        size = path.stat().st_size if path.exists() else 0
+        LOGGER.info("recording stopped: %.3fs, %d bytes, arecord rc=%s", duration, size, process.returncode)
+        if self.last_stderr:
+            LOGGER.warning("arecord stderr: %s", self.last_stderr)
         if process.returncode not in {0, 1, -signal.SIGINT}:
-            LOGGER.warning("arecord exited with %s: %s", process.returncode, stderr.decode(errors="replace").strip())
+            LOGGER.warning("arecord exited with %s", process.returncode)
         return path, duration
 
     def is_usable(self, path: Path, duration: float) -> bool:
+        size = path.stat().st_size if path.exists() else 0
         if duration < self.config.min_record_seconds:
+            LOGGER.info("recording ignored: duration %.3fs below minimum %.3fs", duration, self.config.min_record_seconds)
             return False
-        return path.exists() and path.stat().st_size > 44
+        if size <= 44:
+            LOGGER.warning("recording ignored: empty WAV file %s (%d bytes)", path, size)
+            return False
+        return True
 
 
 class PcmPlayer:
@@ -93,7 +105,7 @@ class PcmPlayer:
             "raw",
             "-",
         ]
-        process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             assert process.stdin is not None
             for chunk in chunks:
@@ -103,6 +115,9 @@ class PcmPlayer:
         finally:
             if process.stdin is not None:
                 process.stdin.close()
-            rc = process.wait(timeout=30)
+            stderr = process.stderr.read() if process.stderr is not None else b""
+            process.wait(timeout=30)
+            rc = process.returncode
             if rc != 0:
-                raise RuntimeError(f"aplay exited with {rc}")
+                detail = stderr.decode(errors="replace").strip()
+                raise RuntimeError(f"aplay exited with {rc}: {detail}")

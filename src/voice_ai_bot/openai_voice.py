@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import queue
 import re
+import socket
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -112,8 +114,24 @@ class TtsQueue:
 class OpenAIVoiceClient:
     def __init__(self, config: Config):
         self.config = config
-        self.client = OpenAI(api_key=config.openai_api_key)
+        self.client = OpenAI(api_key=config.openai_api_key, timeout=config.openai_timeout_seconds)
         self.player = PcmPlayer(config.audio_playback_device)
+
+    def wait_for_connectivity(self) -> None:
+        host = self.config.openai_connectivity_host
+        deadline = time.monotonic() + self.config.openai_connectivity_wait_seconds
+        last_error: OSError | None = None
+        while True:
+            try:
+                with socket.create_connection((host, 443), timeout=5):
+                    return
+            except OSError as exc:
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"network is not ready for {host}:443") from last_error
+                LOGGER.warning("waiting for network/DNS before OpenAI call: %s", exc)
+                time.sleep(min(5.0, remaining))
 
     def transcribe(self, audio_path: Path) -> str:
         LOGGER.info("transcribing %s", audio_path)

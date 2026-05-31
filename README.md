@@ -10,6 +10,7 @@ Behavior:
 - The LED blinks while the API call and speech playback are running.
 - Double-click the button to clear the saved conversation.
 - Conversation history is persisted as JSON on the Pi.
+- Before calling OpenAI, the daemon waits for DNS and TCP connectivity to `api.openai.com`; this avoids losing the first turn while Wi-Fi is still settling after boot.
 
 ## Hardware Defaults
 
@@ -35,3 +36,9 @@ aplay -D plughw:1,0 /tmp/test.wav
 ```
 
 The service intentionally keeps secrets out of git. `.env` is copied to the Pi during install but is ignored locally and remotely.
+
+If a turn fails, the LED flashes rapidly several times and the journal includes the root error:
+
+```bash
+sudo journalctl -u voice-ai-bot -n 120 --no-pager
+```

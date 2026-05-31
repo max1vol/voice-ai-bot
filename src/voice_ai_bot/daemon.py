@@ -38,13 +38,16 @@ class VoiceDaemon:
                 self._handle_press()
             except Exception:
                 LOGGER.exception("button turn failed")
+                self.hardware.signal_error()
                 self.hardware.off()
 
     def _handle_press(self) -> None:
+        LOGGER.info("button pressed")
         self.hardware.on()
         recording_path = self.recorder.start()
         self.hardware.wait_for_release()
         recording_path, duration = self.recorder.stop()
+        LOGGER.info("button released after %.3fs", duration)
         self.hardware.off()
 
         if duration <= self.config.short_click_seconds and self._consume_second_click():
@@ -58,6 +61,7 @@ class VoiceDaemon:
             return
 
         with self.hardware.blinking():
+            self.openai.wait_for_connectivity()
             transcript = self.openai.transcribe(recording_path)
             history = self.conversation.load()
             answer = self.openai.respond_and_speak(history, transcript)

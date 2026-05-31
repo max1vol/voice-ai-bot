@@ -37,6 +37,9 @@ class Config:
     openai_api_key: str
     openai_model: str
     openai_reasoning_effort: str
+    openai_connectivity_host: str
+    openai_connectivity_wait_seconds: float
+    openai_timeout_seconds: float
     transcription_model: str
     tts_model: str
     tts_voice: str
@@ -67,6 +70,9 @@ class Config:
             openai_api_key=api_key,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
             openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low"),
+            openai_connectivity_host=os.getenv("OPENAI_CONNECTIVITY_HOST", "api.openai.com"),
+            openai_connectivity_wait_seconds=_float_env("OPENAI_CONNECTIVITY_WAIT_SECONDS", 120.0),
+            openai_timeout_seconds=_float_env("OPENAI_TIMEOUT_SECONDS", 120.0),
             transcription_model=os.getenv("TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
             tts_model=os.getenv("TTS_MODEL", "gpt-4o-mini-tts"),
             tts_voice=os.getenv("TTS_VOICE", "cedar"),
