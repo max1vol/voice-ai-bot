@@ -90,6 +90,22 @@ class PcmPlayer:
         self.playback_device = playback_device
 
     def play_pcm_stream(self, chunks) -> None:
+        with self.open_stream() as stream:
+            for chunk in chunks:
+                stream.write(chunk)
+
+    def open_stream(self, rate: int = 24000, channels: int = 1) -> "PcmOutputStream":
+        return PcmOutputStream(self.playback_device, rate, channels)
+
+
+class PcmOutputStream:
+    def __init__(self, playback_device: str, rate: int, channels: int):
+        self.playback_device = playback_device
+        self.rate = rate
+        self.channels = channels
+        self.process: subprocess.Popen[bytes] | None = None
+
+    def __enter__(self) -> "PcmOutputStream":
         command = [
             "aplay",
             "-q",
@@ -98,26 +114,34 @@ class PcmPlayer:
             "-f",
             "S16_LE",
             "-r",
-            "24000",
+            str(self.rate),
             "-c",
-            "1",
+            str(self.channels),
             "-t",
             "raw",
             "-",
         ]
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            assert process.stdin is not None
-            for chunk in chunks:
-                if chunk:
-                    process.stdin.write(chunk)
-                    process.stdin.flush()
-        finally:
-            if process.stdin is not None:
-                process.stdin.close()
-            stderr = process.stderr.read() if process.stderr is not None else b""
-            process.wait(timeout=30)
-            rc = process.returncode
-            if rc != 0:
-                detail = stderr.decode(errors="replace").strip()
-                raise RuntimeError(f"aplay exited with {rc}: {detail}")
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        return self
+
+    def write(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("PCM output stream is not open")
+        self.process.stdin.write(chunk)
+        self.process.stdin.flush()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.process is None:
+            return
+        process = self.process
+        self.process = None
+        if process.stdin is not None:
+            process.stdin.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        process.wait(timeout=30)
+        rc = process.returncode
+        if rc != 0 and exc_type is None:
+            detail = stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"aplay exited with {rc}: {detail}")

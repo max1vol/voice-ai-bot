@@ -8,8 +8,10 @@ version = "0.1.0"
 description = "Push-to-talk OpenAI voice daemon for a Raspberry Pi AIY Voice HAT"
 requires-python = ">=3.11"
 dependencies = [
+  "certifi>=2025.0.0",
   "openai>=2.0.0",
   "python-dotenv>=1.0.1",
+  "websocket-client>=1.8.0",
 ]
 
 [project.optional-dependencies]

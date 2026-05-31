@@ -14,6 +14,15 @@ SYSTEM_PROMPT = (
     "Keep replies concise, natural, and suitable for being spoken aloud."
 )
 
+REALTIME_SYSTEM_PROMPT = (
+    "You are a push-to-talk English/Russian voice translator and assistant running on a small speaker. "
+    "The user's language is either English or Russian and is unlikely to be any other language. "
+    "Default to directional translation: translate English speech into Russian and Russian speech into English, "
+    "speaking only the translation. If the user clearly asks a question or asks for assistant behavior instead of "
+    "translation, answer concisely in the requested language. If the user asks you to stop, close, disconnect, sleep, "
+    "or end the session, call the close_realtime_session tool."
+)
+
 
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -35,6 +44,7 @@ def _int_env(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Config:
     openai_api_key: str
+    voice_bot_backend: str
     openai_model: str
     openai_reasoning_effort: str
     openai_connectivity_host: str
@@ -44,6 +54,15 @@ class Config:
     tts_model: str
     tts_voice: str
     tts_instructions: str
+    realtime_model: str
+    realtime_reasoning_effort: str
+    realtime_voice: str
+    realtime_input_rate: int
+    realtime_input_transcription_model: str
+    realtime_response_timeout_seconds: float
+    realtime_max_session_seconds: float
+    realtime_history_messages: int
+    realtime_safety_identifier: str
     button_gpio: int
     led_gpio: int
     button_pull_up: bool
@@ -65,9 +84,14 @@ class Config:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required")
+        backend = os.getenv("VOICE_BOT_BACKEND", "responses").strip().lower()
+        if backend not in {"responses", "realtime"}:
+            raise RuntimeError("VOICE_BOT_BACKEND must be either 'responses' or 'realtime'")
+        realtime_input_rate = _int_env("REALTIME_INPUT_RATE", 24000)
 
         return cls(
             openai_api_key=api_key,
+            voice_bot_backend=backend,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
             openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low"),
             openai_connectivity_host=os.getenv("OPENAI_CONNECTIVITY_HOST", "api.openai.com"),
@@ -80,6 +104,15 @@ class Config:
                 "TTS_INSTRUCTIONS",
                 "Speak naturally. Match the user's language. Keep the response clear and comfortable to listen to.",
             ),
+            realtime_model=os.getenv("REALTIME_MODEL", "gpt-realtime-2"),
+            realtime_reasoning_effort=os.getenv("REALTIME_REASONING_EFFORT", "low"),
+            realtime_voice=os.getenv("REALTIME_VOICE", "marin"),
+            realtime_input_rate=realtime_input_rate,
+            realtime_input_transcription_model=os.getenv("REALTIME_INPUT_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
+            realtime_response_timeout_seconds=_float_env("REALTIME_RESPONSE_TIMEOUT_SECONDS", 90.0),
+            realtime_max_session_seconds=_float_env("REALTIME_MAX_SESSION_SECONDS", 120.0),
+            realtime_history_messages=_int_env("REALTIME_HISTORY_MESSAGES", 16),
+            realtime_safety_identifier=os.getenv("REALTIME_SAFETY_IDENTIFIER", "voice-ai-bot-local"),
             button_gpio=_int_env("BUTTON_GPIO", 23),
             led_gpio=_int_env("LED_GPIO", 25),
             button_pull_up=_bool_env("BUTTON_PULL_UP", True),
@@ -87,7 +120,7 @@ class Config:
             double_click_window_seconds=_float_env("DOUBLE_CLICK_WINDOW_SECONDS", 0.65),
             audio_capture_device=os.getenv("AUDIO_CAPTURE_DEVICE", "plughw:1,0"),
             audio_playback_device=os.getenv("AUDIO_PLAYBACK_DEVICE", "plughw:1,0"),
-            record_rate=_int_env("RECORD_RATE", 16000),
+            record_rate=_int_env("RECORD_RATE", realtime_input_rate if backend == "realtime" else 16000),
             record_channels=_int_env("RECORD_CHANNELS", 1),
             min_record_seconds=_float_env("MIN_RECORD_SECONDS", 0.25),
             conversation_file=Path(os.getenv("CONVERSATION_FILE", "/var/lib/voice-ai-bot/conversation.json")),

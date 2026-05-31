@@ -11,6 +11,7 @@ from .config import Config
 from .conversation import ConversationStore
 from .hardware import HatHardware
 from .openai_voice import OpenAIVoiceClient
+from .realtime_voice import RealtimeVoiceClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,15 +22,22 @@ class VoiceDaemon:
         self.hardware = HatHardware(config.button_gpio, config.led_gpio, config.button_pull_up)
         self.recorder = Recorder(config)
         self.conversation = ConversationStore(config.conversation_file)
-        self.openai = OpenAIVoiceClient(config)
+        self.openai = OpenAIVoiceClient(config) if config.voice_bot_backend == "responses" else None
+        self.realtime = RealtimeVoiceClient(config) if config.voice_bot_backend == "realtime" else None
         self.running = True
+        if config.voice_bot_backend == "realtime" and config.record_rate != config.realtime_input_rate:
+            LOGGER.warning(
+                "realtime backend expects RECORD_RATE=%s; current RECORD_RATE=%s",
+                config.realtime_input_rate,
+                config.record_rate,
+            )
 
     def stop(self) -> None:
         self.running = False
         self.hardware.off()
 
     def run(self) -> None:
-        LOGGER.info("voice daemon ready")
+        LOGGER.info("voice daemon ready with %s backend", self.config.voice_bot_backend)
         self.hardware.off()
         while self.running:
             if not self.hardware.wait_for_press(timeout=0.5):
@@ -61,12 +69,23 @@ class VoiceDaemon:
             return
 
         with self.hardware.blinking():
-            self.openai.wait_for_connectivity()
-            transcript = self.openai.transcribe(recording_path)
             history = self.conversation.load()
-            answer = self.openai.respond_and_speak(history, transcript)
-            self.conversation.append_pair(transcript, answer)
-            LOGGER.info("turn complete")
+            if self.config.voice_bot_backend == "realtime":
+                assert self.realtime is not None
+                self.realtime.wait_for_connectivity()
+                result = self.realtime.respond_to_audio(history, recording_path)
+                if result.assistant_text:
+                    self.conversation.append_pair(result.user_text or "[voice input]", result.assistant_text)
+                elif result.requested_close and result.user_text:
+                    self.conversation.append_pair(result.user_text, "[realtime session closed]")
+                LOGGER.info("realtime turn complete")
+            else:
+                assert self.openai is not None
+                self.openai.wait_for_connectivity()
+                transcript = self.openai.transcribe(recording_path)
+                answer = self.openai.respond_and_speak(history, transcript)
+                self.conversation.append_pair(transcript, answer)
+                LOGGER.info("turn complete")
 
     def _consume_second_click(self) -> bool:
         if not self.hardware.wait_for_press(timeout=self.config.double_click_window_seconds):
