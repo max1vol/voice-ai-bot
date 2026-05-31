@@ -60,9 +60,18 @@ class Config:
     realtime_input_rate: int
     realtime_input_transcription_model: str
     realtime_response_timeout_seconds: float
+    realtime_idle_timeout_seconds: float
     realtime_max_session_seconds: float
     realtime_history_messages: int
     realtime_safety_identifier: str
+    user_city: str
+    user_region: str
+    user_country: str
+    user_timezone: str
+    web_search_model: str
+    web_search_reasoning_effort: str
+    web_search_context_size: str
+    web_search_timeout_seconds: float
     button_gpio: int
     led_gpio: int
     button_pull_up: bool
@@ -110,9 +119,18 @@ class Config:
             realtime_input_rate=realtime_input_rate,
             realtime_input_transcription_model=os.getenv("REALTIME_INPUT_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
             realtime_response_timeout_seconds=_float_env("REALTIME_RESPONSE_TIMEOUT_SECONDS", 90.0),
+            realtime_idle_timeout_seconds=_float_env("REALTIME_IDLE_TIMEOUT_SECONDS", 45.0),
             realtime_max_session_seconds=_float_env("REALTIME_MAX_SESSION_SECONDS", 120.0),
             realtime_history_messages=_int_env("REALTIME_HISTORY_MESSAGES", 16),
             realtime_safety_identifier=os.getenv("REALTIME_SAFETY_IDENTIFIER", "voice-ai-bot-local"),
+            user_city=os.getenv("USER_CITY", "Cambridge"),
+            user_region=os.getenv("USER_REGION", "Cambridgeshire"),
+            user_country=os.getenv("USER_COUNTRY", "GB"),
+            user_timezone=os.getenv("USER_TIMEZONE", "Europe/London"),
+            web_search_model=os.getenv("WEB_SEARCH_MODEL", "gpt-5.5"),
+            web_search_reasoning_effort=os.getenv("WEB_SEARCH_REASONING_EFFORT", "medium"),
+            web_search_context_size=os.getenv("WEB_SEARCH_CONTEXT_SIZE", "medium"),
+            web_search_timeout_seconds=_float_env("WEB_SEARCH_TIMEOUT_SECONDS", 90.0),
             button_gpio=_int_env("BUTTON_GPIO", 23),
             led_gpio=_int_env("LED_GPIO", 25),
             button_pull_up=_bool_env("BUTTON_PULL_UP", True),

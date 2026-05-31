@@ -11,7 +11,7 @@ from .config import Config
 from .conversation import ConversationStore
 from .hardware import HatHardware
 from .openai_voice import OpenAIVoiceClient
-from .realtime_voice import RealtimeVoiceClient
+from .realtime_voice import RealtimeConversationSession
 
 LOGGER = logging.getLogger(__name__)
 
@@ -23,8 +23,9 @@ class VoiceDaemon:
         self.recorder = Recorder(config)
         self.conversation = ConversationStore(config.conversation_file)
         self.openai = OpenAIVoiceClient(config) if config.voice_bot_backend == "responses" else None
-        self.realtime = RealtimeVoiceClient(config) if config.voice_bot_backend == "realtime" else None
+        self.realtime = RealtimeConversationSession(config) if config.voice_bot_backend == "realtime" else None
         self.running = True
+        self._led_mode = "off"
         if config.voice_bot_backend == "realtime" and config.record_rate != config.realtime_input_rate:
             LOGGER.warning(
                 "realtime backend expects RECORD_RATE=%s; current RECORD_RATE=%s",
@@ -34,9 +35,14 @@ class VoiceDaemon:
 
     def stop(self) -> None:
         self.running = False
+        if self.realtime is not None:
+            self.realtime.close()
         self.hardware.off()
 
     def run(self) -> None:
+        if self.config.voice_bot_backend == "realtime":
+            self._run_realtime()
+            return
         LOGGER.info("voice daemon ready with %s backend", self.config.voice_bot_backend)
         self.hardware.off()
         while self.running:
@@ -48,6 +54,85 @@ class VoiceDaemon:
                 LOGGER.exception("button turn failed")
                 self.hardware.signal_error()
                 self.hardware.off()
+
+    def _run_realtime(self) -> None:
+        LOGGER.info("voice daemon ready with realtime streaming backend")
+        self._set_led_mode("off")
+        while self.running:
+            try:
+                self._drain_realtime_turns()
+                assert self.realtime is not None
+                self.realtime.check_health()
+                self.realtime.close_if_too_old()
+                self.realtime.close_if_idle()
+                self._sync_realtime_led()
+                if not self.hardware.wait_for_press(timeout=0.05):
+                    continue
+                self._handle_realtime_press()
+            except Exception:
+                LOGGER.exception("realtime loop failed")
+                if self.realtime is not None:
+                    self.realtime.close()
+                self.hardware.signal_error()
+                self._led_mode = "off"
+
+    def _handle_realtime_press(self) -> None:
+        assert self.realtime is not None
+        LOGGER.info("realtime button pressed")
+        self._set_led_mode("on")
+        self.realtime.begin_turn(self.conversation.load())
+        self.hardware.wait_for_release()
+        duration = self.realtime.stop_recording()
+        LOGGER.info("realtime button released after %.3fs", duration)
+
+        if duration <= self.config.short_click_seconds and self._consume_second_click():
+            LOGGER.info("double click detected; clearing conversation and closing realtime session")
+            self.realtime.clear_pending_input()
+            self.realtime.close()
+            self.conversation.clear()
+            self.hardware.confirm_clear()
+            self._led_mode = "off"
+            return
+
+        if duration < self.config.min_record_seconds:
+            LOGGER.info("ignoring short realtime recording: %.3fs", duration)
+            self.realtime.clear_pending_input()
+            self._set_led_mode("off")
+            return
+
+        self.realtime.commit_recording()
+        self._set_led_mode("blink")
+
+    def _drain_realtime_turns(self) -> None:
+        if self.realtime is None:
+            return
+        for result in self.realtime.pop_completed_turns():
+            if result.assistant_text:
+                self.conversation.append_pair(result.user_text or "[voice input]", result.assistant_text)
+                LOGGER.info("realtime turn persisted")
+            elif result.requested_close and result.user_text:
+                self.conversation.append_pair(result.user_text, "[realtime session closed]")
+                LOGGER.info("realtime close turn persisted")
+
+    def _sync_realtime_led(self) -> None:
+        assert self.realtime is not None
+        if self.realtime.is_recording:
+            self._set_led_mode("on")
+        elif self.realtime.is_responding:
+            self._set_led_mode("blink")
+        else:
+            self._set_led_mode("off")
+
+    def _set_led_mode(self, mode: str) -> None:
+        if self._led_mode == mode:
+            return
+        self._led_mode = mode
+        if mode == "on":
+            self.hardware.on()
+        elif mode == "blink":
+            self.hardware.blink()
+        else:
+            self.hardware.off()
 
     def _handle_press(self) -> None:
         LOGGER.info("button pressed")

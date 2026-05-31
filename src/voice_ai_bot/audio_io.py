@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,6 +105,9 @@ class PcmOutputStream:
         self.rate = rate
         self.channels = channels
         self.process: subprocess.Popen[bytes] | None = None
+        self.bytes_written = 0
+        self._lock = threading.Lock()
+        self._aborted = False
 
     def __enter__(self) -> "PcmOutputStream":
         command = [
@@ -127,21 +131,112 @@ class PcmOutputStream:
     def write(self, chunk: bytes) -> None:
         if not chunk:
             return
-        if self.process is None or self.process.stdin is None:
-            raise RuntimeError("PCM output stream is not open")
-        self.process.stdin.write(chunk)
-        self.process.stdin.flush()
+        with self._lock:
+            if self._aborted:
+                return
+            if self.process is None or self.process.stdin is None:
+                raise RuntimeError("PCM output stream is not open")
+            self.process.stdin.write(chunk)
+            self.process.stdin.flush()
+            self.bytes_written += len(chunk)
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self.process is None:
-            return
-        process = self.process
-        self.process = None
-        if process.stdin is not None:
-            process.stdin.close()
-        stderr = process.stderr.read() if process.stderr is not None else b""
-        process.wait(timeout=30)
+    def abort(self) -> None:
+        with self._lock:
+            self._aborted = True
+            process = self.process
+            if process is None:
+                return
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if process.poll() is None:
+                process.terminate()
+
+    def close(self, check: bool = True) -> None:
+        with self._lock:
+            process = self.process
+            self.process = None
+            if process is None:
+                return
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+        try:
+            stderr = process.stderr.read() if process.stderr is not None else b""
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stderr = process.stderr.read() if process.stderr is not None else b""
+            process.wait(timeout=5)
         rc = process.returncode
-        if rc != 0 and exc_type is None:
+        if check and rc != 0 and not self._aborted:
             detail = stderr.decode(errors="replace").strip()
             raise RuntimeError(f"aplay exited with {rc}: {detail}")
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close(check=exc_type is None)
+
+
+class RawPcmRecorder:
+    def __init__(self, config: Config):
+        self.config = config
+        self.process: subprocess.Popen[bytes] | None = None
+        self.started_at = 0.0
+        self.last_stderr = ""
+
+    def start(self) -> None:
+        if self.process is not None:
+            raise RuntimeError("raw recording is already active")
+        command = [
+            "arecord",
+            "-q",
+            "-D",
+            self.config.audio_capture_device,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(self.config.realtime_input_rate),
+            "-c",
+            "1",
+            "-t",
+            "raw",
+            "-",
+        ]
+        LOGGER.info("starting raw recorder: %s", " ".join(command))
+        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.started_at = time.monotonic()
+
+    def read(self, size: int = 4096) -> bytes:
+        if self.process is None or self.process.stdout is None:
+            return b""
+        return self.process.stdout.read(size)
+
+    def stop(self) -> float:
+        if self.process is None:
+            return 0.0
+        duration = time.monotonic() - self.started_at
+        process = self.process
+        self.process = None
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        self.last_stderr = stderr.decode(errors="replace").strip()
+        LOGGER.info("raw recording stopped: %.3fs, arecord rc=%s", duration, process.returncode)
+        if self.last_stderr:
+            LOGGER.warning("arecord stderr: %s", self.last_stderr)
+        if process.returncode not in {0, 1, -signal.SIGINT}:
+            LOGGER.warning("arecord exited with %s", process.returncode)
+        return duration

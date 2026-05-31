@@ -4,8 +4,11 @@ from voice_ai_bot.conversation import Message
 from voice_ai_bot.realtime_voice import (
     CLOSE_TOOL_NAME,
     conversation_item_for_message,
+    event_is_ignorable_control_error,
     extract_response_text,
     iter_wav_pcm16_chunks,
+    parse_tool_arguments,
+    response_function_calls,
     response_requested_close,
 )
 
@@ -49,6 +52,8 @@ def test_response_requested_close_detects_close_tool():
     }
 
     assert response_requested_close(response)
+    assert response_function_calls(response, CLOSE_TOOL_NAME) == response["output"]
+    assert parse_tool_arguments(response["output"][0]) == {"reason": "user asked to stop"}
 
 
 def test_extract_response_text_reads_audio_transcript():
@@ -65,3 +70,25 @@ def test_extract_response_text_reads_audio_transcript():
     }
 
     assert extract_response_text(response) == "Hello there"
+
+
+def test_control_errors_can_be_ignored_by_event_id():
+    assert event_is_ignorable_control_error(
+        {
+            "type": "error",
+            "error": {
+                "event_id": "cancel_123",
+                "message": "No active response.",
+            },
+        }
+    )
+    assert event_is_ignorable_control_error(
+        {
+            "type": "error",
+            "error": {
+                "event_id": "truncate_123",
+                "message": "Item already done.",
+            },
+        }
+    )
+    assert not event_is_ignorable_control_error({"type": "error", "error": {"event_id": "other"}})
