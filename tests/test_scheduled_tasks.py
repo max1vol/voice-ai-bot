@@ -29,11 +29,14 @@ def test_rejects_spoken_scheduled_task_during_quiet_hours(tmp_path):
     store = ScheduledTaskStore(_config(tmp_path))
 
     before_quiet_end = store.add(title="Too early", prompt="Wake up", run_at="2026-06-02T07:00:00")
+    one_minute_before_quiet_end = store.add(title="Still too early", prompt="Wake up", run_at="2026-06-02T07:29:00")
     at_quiet_start = store.add(title="Too late", prompt="Reminder", run_at="2026-06-02T21:00:00")
     at_quiet_end = store.add(title="Allowed", prompt="Wake up", run_at="2026-06-02T07:30:00")
 
     assert not before_quiet_end["ok"]
     assert "quiet hours" in before_quiet_end["error"]
+    assert not one_minute_before_quiet_end["ok"]
+    assert "quiet hours" in one_minute_before_quiet_end["error"]
     assert not at_quiet_start["ok"]
     assert at_quiet_end["ok"]
 
