@@ -1,13 +1,17 @@
 import wave
 
 from voice_ai_bot.conversation import Message
+from voice_ai_bot.config import Config
 from voice_ai_bot.realtime_voice import (
     CLOSE_TOOL_NAME,
+    START_TASK_TOOL_NAME,
+    RealtimeConversationSession,
     conversation_item_for_message,
     event_is_ignorable_control_error,
     extract_response_text,
     iter_wav_pcm16_chunks,
     parse_tool_arguments,
+    realtime_tools,
     response_function_calls,
     response_requested_close,
 )
@@ -53,6 +57,7 @@ def test_response_requested_close_detects_close_tool():
 
     assert response_requested_close(response)
     assert response_function_calls(response, CLOSE_TOOL_NAME) == response["output"]
+    assert response_function_calls(response) == response["output"]
     assert parse_tool_arguments(response["output"][0]) == {"reason": "user asked to stop"}
 
 
@@ -92,3 +97,80 @@ def test_control_errors_can_be_ignored_by_event_id():
         }
     )
     assert not event_is_ignorable_control_error({"type": "error", "error": {"event_id": "other"}})
+
+
+def test_realtime_tools_use_async_background_task_interface():
+    tool_names = {tool["name"] for tool in realtime_tools()}
+
+    assert START_TASK_TOOL_NAME in tool_names
+    assert "list_background_tasks" in tool_names
+    assert "get_background_task" in tool_names
+    assert "cancel_background_task" in tool_names
+    assert "web_search" not in tool_names
+
+
+def test_interrupt_skips_truncate_when_session_is_closed(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    with session._state_lock:
+        session._output_item_id = "item_123"
+        session._output_audio_bytes = 4800
+        session._interrupt_response_locked()
+
+    assert session._output_item_id == ""
+    assert session._output_audio_bytes == 0
+
+
+def _config(tmp_path):
+    return Config(
+        openai_api_key="sk-test",
+        voice_bot_backend="realtime",
+        openai_model="gpt-5.5",
+        openai_reasoning_effort="low",
+        openai_connectivity_host="api.openai.com",
+        openai_connectivity_wait_seconds=1.0,
+        openai_timeout_seconds=1.0,
+        transcription_model="gpt-4o-transcribe",
+        tts_model="gpt-4o-mini-tts",
+        tts_voice="cedar",
+        tts_instructions="test",
+        realtime_model="gpt-realtime-2",
+        realtime_reasoning_effort="low",
+        realtime_voice="marin",
+        realtime_input_rate=24000,
+        realtime_input_transcription_model="gpt-4o-transcribe",
+        realtime_response_timeout_seconds=1.0,
+        realtime_idle_timeout_seconds=1.0,
+        realtime_max_session_seconds=1.0,
+        realtime_history_messages=4,
+        realtime_safety_identifier="test",
+        user_city="Cambridge",
+        user_region="Cambridgeshire",
+        user_country="GB",
+        user_timezone="Europe/London",
+        web_search_model="gpt-5.5",
+        web_search_reasoning_effort="medium",
+        web_search_context_size="medium",
+        web_search_timeout_seconds=1.0,
+        task_model="gpt-5.5",
+        task_reasoning_effort="medium",
+        task_reasoning_summary="auto",
+        task_timeout_seconds=1.0,
+        task_code_execution=True,
+        max_background_tasks=20,
+        task_result_chars=12000,
+        task_summary_chars=4000,
+        button_gpio=23,
+        led_gpio=25,
+        button_pull_up=True,
+        short_click_seconds=0.45,
+        double_click_window_seconds=0.65,
+        audio_capture_device="plughw:1,0",
+        audio_playback_device="plughw:1,0",
+        record_rate=24000,
+        record_channels=1,
+        min_record_seconds=0.25,
+        conversation_file=tmp_path / "conversation.json",
+        recordings_dir=tmp_path / "recordings",
+        tts_chunk_chars=240,
+        log_level="INFO",
+    )

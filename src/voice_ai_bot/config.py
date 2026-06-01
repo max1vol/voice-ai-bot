@@ -72,6 +72,14 @@ class Config:
     web_search_reasoning_effort: str
     web_search_context_size: str
     web_search_timeout_seconds: float
+    task_model: str
+    task_reasoning_effort: str
+    task_reasoning_summary: str
+    task_timeout_seconds: float
+    task_code_execution: bool
+    max_background_tasks: int
+    task_result_chars: int
+    task_summary_chars: int
     button_gpio: int
     led_gpio: int
     button_pull_up: bool
@@ -131,6 +139,16 @@ class Config:
             web_search_reasoning_effort=os.getenv("WEB_SEARCH_REASONING_EFFORT", "medium"),
             web_search_context_size=os.getenv("WEB_SEARCH_CONTEXT_SIZE", "medium"),
             web_search_timeout_seconds=_float_env("WEB_SEARCH_TIMEOUT_SECONDS", 90.0),
+            task_model=os.getenv("TASK_MODEL", os.getenv("WEB_SEARCH_MODEL", "gpt-5.5")),
+            task_reasoning_effort=os.getenv(
+                "TASK_REASONING_EFFORT", os.getenv("WEB_SEARCH_REASONING_EFFORT", "medium")
+            ),
+            task_reasoning_summary=os.getenv("TASK_REASONING_SUMMARY", "auto"),
+            task_timeout_seconds=_float_env("TASK_TIMEOUT_SECONDS", 180.0),
+            task_code_execution=_bool_env("TASK_CODE_EXECUTION", True),
+            max_background_tasks=_int_env("MAX_BACKGROUND_TASKS", 20),
+            task_result_chars=_int_env("TASK_RESULT_CHARS", 12000),
+            task_summary_chars=_int_env("TASK_SUMMARY_CHARS", 4000),
             button_gpio=_int_env("BUTTON_GPIO", 23),
             led_gpio=_int_env("LED_GPIO", 25),
             button_pull_up=_bool_env("BUTTON_PULL_UP", True),

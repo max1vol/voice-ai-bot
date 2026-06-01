@@ -74,6 +74,10 @@ class VoiceDaemon:
                 if self.realtime is not None:
                     self.realtime.close()
                 self.hardware.signal_error()
+                try:
+                    self.hardware.wait_for_release(timeout=2)
+                except Exception:
+                    LOGGER.exception("failed while waiting for button release after realtime error")
                 self._led_mode = "off"
 
     def _handle_realtime_press(self) -> None:

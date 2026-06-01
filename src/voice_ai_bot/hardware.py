@@ -17,6 +17,7 @@ class HatHardware:
         self.led = LED(led_gpio)
         self._blink_stop = threading.Event()
         self._blink_thread: threading.Thread | None = None
+        LOGGER.info("AIY HAT GPIO configured: button=%s pull_up=%s led=%s", button_gpio, pull_up, led_gpio)
 
     def wait_for_press(self, timeout: float | None = None) -> bool:
         return bool(self.button.wait_for_press(timeout=timeout))

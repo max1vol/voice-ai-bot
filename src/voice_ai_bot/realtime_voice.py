@@ -8,9 +8,10 @@ import socket
 import threading
 import time
 import wave
+import uuid
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -28,6 +29,17 @@ LOGGER = logging.getLogger(__name__)
 
 CLOSE_TOOL_NAME = "close_realtime_session"
 WEB_SEARCH_TOOL_NAME = "web_search"
+START_TASK_TOOL_NAME = "start_background_task"
+LIST_TASKS_TOOL_NAME = "list_background_tasks"
+GET_TASK_TOOL_NAME = "get_background_task"
+CANCEL_TASK_TOOL_NAME = "cancel_background_task"
+ASYNC_TASK_TOOL_NAMES = {
+    START_TASK_TOOL_NAME,
+    LIST_TASKS_TOOL_NAME,
+    GET_TASK_TOOL_NAME,
+    CANCEL_TASK_TOOL_NAME,
+    WEB_SEARCH_TOOL_NAME,
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,23 @@ class RealtimeTurnResult:
     user_text: str
     assistant_text: str
     requested_close: bool
+
+
+@dataclass
+class BackgroundTask:
+    id: str
+    query: str
+    status: str = "queued"
+    progress: str = "queued"
+    response_id: str = ""
+    result: str = ""
+    reasoning_summary: str = ""
+    error: str = ""
+    events: list[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 def local_context(config: Config) -> str:
@@ -56,8 +85,12 @@ def realtime_session_instructions(config: Config) -> str:
         f"{REALTIME_SYSTEM_PROMPT} "
         f"The user is in {config.user_city}, {config.user_region}, {config.user_country}. "
         "For each response, the application will provide current local time and location context. "
-        "Use the web_search tool when the user asks about current, recent, local, weather, news, opening-hours, "
-        "price, schedule, or otherwise time-sensitive facts. "
+        "Use start_background_task when the user asks about current, recent, local, weather, news, opening-hours, "
+        "price, schedule, or otherwise time-sensitive facts. Prefer the background task tools for web, code, "
+        "calculation, or multi-step research so the voice session stays interruptible. "
+        "When start_background_task returns a running task, briefly tell the user it started instead of polling "
+        "repeatedly in the same response. Use list_background_tasks or get_background_task when the user asks "
+        "what is running, asks for progress, or asks for results. "
         "If interrupted by a new button press, stop the previous reply and treat the new speech as the latest user turn."
     )
 
@@ -92,23 +125,369 @@ def realtime_tools() -> list[dict[str, Any]]:
         },
         {
             "type": "function",
-            "name": WEB_SEARCH_TOOL_NAME,
+            "name": START_TASK_TOOL_NAME,
             "description": (
-                "Search the live web through a GPT-5.5 Responses request. Use for current, recent, local, "
-                "weather, news, opening-hours, price, schedule, or other facts that may have changed."
+                "Start an asynchronous GPT-5.5 task for current web research, code generation, code execution, "
+                "calculation, or multi-step analysis. The task runs in the app while the realtime voice session "
+                "continues; use list_background_tasks or get_background_task later to report progress or results."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "A concise search question, including location or date when relevant.",
-                    }
+                        "description": "The full task request, including location, date, or constraints when relevant.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional short human-readable title for the task.",
+                    },
                 },
                 "required": ["query"],
             },
         },
+        {
+            "type": "function",
+            "name": LIST_TASKS_TOOL_NAME,
+            "description": "List background GPT-5.5 tasks, including running status and latest progress summaries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_completed": {
+                        "type": "boolean",
+                        "description": "Include completed, failed, and cancelled tasks as well as running tasks.",
+                    }
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": GET_TASK_TOOL_NAME,
+            "description": "Get progress, reasoning-summary text, and final result for a background task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id returned by start_background_task. If omitted, returns the newest task.",
+                    },
+                    "include_result": {
+                        "type": "boolean",
+                        "description": "Include the task result text. Use true when reporting a completed task.",
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": CANCEL_TASK_TOOL_NAME,
+            "description": "Cancel a running background GPT-5.5 task when the user no longer wants it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id returned by start_background_task.",
+                    }
+                },
+                "required": ["task_id"],
+            },
+        },
     ]
+
+
+class BackgroundTaskManager:
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = OpenAI(api_key=config.openai_api_key, timeout=config.task_timeout_seconds)
+        self._tasks: dict[str, BackgroundTask] = {}
+        self._lock = threading.RLock()
+
+    def start(self, query: str, title: str = "") -> dict[str, Any]:
+        query = query.strip()
+        if not query:
+            return {"ok": False, "error": "query is required"}
+        task_id = f"task_{uuid.uuid4().hex[:10]}"
+        task = BackgroundTask(id=task_id, query=query)
+        if title.strip():
+            task.progress = f"queued: {title.strip()}"
+        with self._lock:
+            self._prune_locked()
+            if len(self._tasks) >= self.config.max_background_tasks:
+                return {"ok": False, "error": "too many retained background tasks; cancel or wait for older tasks"}
+            self._tasks[task_id] = task
+        thread = threading.Thread(target=self._run_task, args=(task_id,), name=f"task-{task_id}", daemon=True)
+        thread.start()
+        LOGGER.info("started background task %s: %s", task_id, query)
+        return {"ok": True, "task": self._snapshot(task, include_result=False)}
+
+    def list(self, include_completed: bool = False) -> dict[str, Any]:
+        with self._lock:
+            tasks = list(self._tasks.values())
+            if not include_completed:
+                tasks = [task for task in tasks if task.status in {"queued", "running", "cancelling"}]
+            tasks.sort(key=lambda task: task.created_at, reverse=True)
+            return {
+                "ok": True,
+                "tasks": [self._snapshot(task, include_result=False) for task in tasks],
+                "running_count": sum(
+                    1 for task in self._tasks.values() if task.status in {"queued", "running", "cancelling"}
+                ),
+            }
+
+    def get(self, task_id: str = "", include_result: bool = True) -> dict[str, Any]:
+        with self._lock:
+            task = self._get_locked(task_id)
+            if task is None:
+                return {"ok": False, "error": f"unknown task id: {task_id or '<latest>'}"}
+            return {"ok": True, "task": self._snapshot(task, include_result=include_result)}
+
+    def cancel(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {"ok": False, "error": f"unknown task id: {task_id}"}
+            if task.status not in {"queued", "running", "cancelling"}:
+                return {"ok": True, "task": self._snapshot(task, include_result=False)}
+            task.cancel_event.set()
+            self._update_locked(task, status="cancelling", progress="cancellation requested")
+            LOGGER.info("cancellation requested for background task %s", task_id)
+            return {"ok": True, "task": self._snapshot(task, include_result=False)}
+
+    def has_running(self) -> bool:
+        with self._lock:
+            return any(task.status in {"queued", "running", "cancelling"} for task in self._tasks.values())
+
+    def _run_task(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            self._update_locked(task, status="running", progress="starting GPT-5.5 task")
+
+        stream = None
+        try:
+            stream = self.client.responses.create(
+                model=self.config.task_model,
+                instructions=background_task_instructions(self.config),
+                input=background_task_prompt(self.config, task.query),
+                reasoning={
+                    "effort": self.config.task_reasoning_effort,
+                    "summary": self.config.task_reasoning_summary,
+                },
+                tools=self._task_tools(),
+                include=self._task_include(),
+                stream=True,
+                store=False,
+                truncation="auto",
+                parallel_tool_calls=True,
+            )
+            for event in stream:
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is None:
+                        return
+                    if task.cancel_event.is_set():
+                        close = getattr(stream, "close", None)
+                        if close is not None:
+                            close()
+                        self._finish_locked(task, "cancelled", "cancelled")
+                        LOGGER.info("background task %s cancelled", task_id)
+                        return
+                self._handle_stream_event(task_id, event)
+
+            with self._lock:
+                task = self._tasks.get(task_id)
+                if task is not None and task.status in {"queued", "running", "cancelling"}:
+                    self._finish_locked(task, "completed", "completed")
+                    LOGGER.info("background task %s completed", task_id)
+        except BaseException as exc:
+            with self._lock:
+                task = self._tasks.get(task_id)
+                if task is not None:
+                    task.error = str(exc)
+                    self._finish_locked(task, "failed", "failed")
+            LOGGER.exception("background task %s failed", task_id)
+
+    def _task_tools(self) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = [
+            {
+                "type": "web_search",
+                "search_context_size": self.config.web_search_context_size,
+                "user_location": {
+                    "type": "approximate",
+                    "country": self.config.user_country,
+                    "city": self.config.user_city,
+                    "region": self.config.user_region,
+                    "timezone": self.config.user_timezone,
+                },
+            }
+        ]
+        if self.config.task_code_execution:
+            tools.append(
+                {
+                    "type": "code_interpreter",
+                    "container": {"type": "auto"},
+                }
+            )
+        return tools
+
+    def _task_include(self) -> list[str]:
+        include = ["web_search_call.action.sources"]
+        if self.config.task_code_execution:
+            include.append("code_interpreter_call.outputs")
+        return include
+
+    def _handle_stream_event(self, task_id: str, event: Any) -> None:
+        event_type = getattr(event, "type", "")
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status not in {"queued", "running", "cancelling"}:
+                return
+
+            if event_type == "response.created":
+                response = getattr(event, "response", None)
+                task.response_id = getattr(response, "id", "") or task.response_id
+                self._update_locked(task, progress="response created")
+            elif event_type == "response.in_progress":
+                self._update_locked(task, progress="model working")
+            elif event_type == "response.web_search_call.in_progress":
+                self._update_locked(task, progress="web search starting")
+                self._append_event_locked(task, "web search starting")
+            elif event_type == "response.web_search_call.searching":
+                self._update_locked(task, progress="searching the web")
+                self._append_event_locked(task, "searching the web")
+            elif event_type == "response.web_search_call.completed":
+                self._update_locked(task, progress="web search completed")
+                self._append_event_locked(task, "web search completed")
+            elif event_type == "response.code_interpreter_call.in_progress":
+                self._update_locked(task, progress="code interpreter starting")
+                self._append_event_locked(task, "code interpreter starting")
+            elif event_type == "response.code_interpreter_call.interpreting":
+                self._update_locked(task, progress="running code")
+                self._append_event_locked(task, "running code")
+            elif event_type == "response.code_interpreter_call.completed":
+                self._update_locked(task, progress="code execution completed")
+                self._append_event_locked(task, "code execution completed")
+            elif event_type == "response.code_interpreter_call_code.delta":
+                code_delta = getattr(event, "delta", "")
+                if code_delta:
+                    self._update_locked(task, progress=f"writing code: {_truncate(code_delta.strip(), 160)}")
+            elif event_type == "response.reasoning_summary_text.delta":
+                delta = getattr(event, "delta", "")
+                if delta:
+                    task.reasoning_summary = _truncate(
+                        task.reasoning_summary + delta,
+                        self.config.task_summary_chars,
+                        keep_tail=True,
+                    )
+                    self._update_locked(task, progress="reasoning")
+            elif event_type == "response.reasoning_summary_text.done":
+                text = getattr(event, "text", "")
+                if text:
+                    task.reasoning_summary = _truncate(text, self.config.task_summary_chars, keep_tail=True)
+                    self._update_locked(task, progress="reasoning summary updated")
+            elif event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", "")
+                if delta:
+                    task.result = _truncate(task.result + delta, self.config.task_result_chars, keep_tail=True)
+                    self._update_locked(task, progress="writing answer")
+            elif event_type == "response.completed":
+                response = getattr(event, "response", None)
+                final_text = getattr(response, "output_text", "") or extract_responses_output_text(response)
+                if final_text and not task.result.strip():
+                    task.result = _truncate(final_text, self.config.task_result_chars, keep_tail=True)
+                task.response_id = getattr(response, "id", "") or task.response_id
+                self._finish_locked(task, "completed", "completed")
+                LOGGER.info("background task %s completed", task_id)
+            elif event_type in {"response.failed", "response.incomplete", "error"}:
+                error = getattr(event, "error", None)
+                task.error = str(error or event_type)
+                self._finish_locked(task, "failed", "failed")
+
+    def _get_locked(self, task_id: str) -> BackgroundTask | None:
+        if task_id:
+            return self._tasks.get(task_id)
+        if not self._tasks:
+            return None
+        return max(self._tasks.values(), key=lambda task: task.created_at)
+
+    def _prune_locked(self) -> None:
+        if len(self._tasks) < self.config.max_background_tasks:
+            return
+        done = [
+            task
+            for task in self._tasks.values()
+            if task.status not in {"queued", "running", "cancelling"}
+        ]
+        done.sort(key=lambda task: task.updated_at)
+        while done and len(self._tasks) >= self.config.max_background_tasks:
+            task = done.pop(0)
+            self._tasks.pop(task.id, None)
+
+    def _snapshot(self, task: BackgroundTask, include_result: bool) -> dict[str, Any]:
+        return {
+            "id": task.id,
+            "query": task.query,
+            "status": task.status,
+            "progress": task.progress,
+            "created_at": _iso_time(task.created_at),
+            "updated_at": _iso_time(task.updated_at),
+            "completed_at": _iso_time(task.completed_at) if task.completed_at else None,
+            "response_id": task.response_id,
+            "reasoning_summary": _truncate(task.reasoning_summary, self.config.task_summary_chars, keep_tail=True),
+            "result": task.result if include_result else _truncate(task.result, 1200),
+            "error": task.error,
+            "events": task.events[-12:],
+        }
+
+    def _update_locked(self, task: BackgroundTask, status: str | None = None, progress: str | None = None) -> None:
+        if status is not None:
+            task.status = status
+        if progress is not None:
+            task.progress = progress
+        task.updated_at = time.time()
+
+    def _finish_locked(self, task: BackgroundTask, status: str, progress: str) -> None:
+        self._update_locked(task, status=status, progress=progress)
+        task.completed_at = time.time()
+
+    def _append_event_locked(self, task: BackgroundTask, text: str) -> None:
+        task.events.append(f"{_iso_time(time.time())}: {text}")
+        if len(task.events) > 50:
+            del task.events[:-50]
+
+
+def background_task_instructions(config: Config) -> str:
+    return (
+        "You are a background research and code-execution worker for a realtime voice assistant. "
+        "Use web_search for current, local, or source-dependent facts. Use code_interpreter for calculations, "
+        "small programs, data processing, or checking code. Produce a concise final answer suitable for the "
+        "voice assistant to summarize aloud, with source names or URLs when web facts matter. "
+        f"{local_context(config)}"
+    )
+
+
+def background_task_prompt(config: Config, query: str) -> str:
+    return (
+        "This task was started from a live push-to-talk Realtime conversation. "
+        "Work independently and stream reasoning summaries so the voice model can report progress. "
+        f"{local_context(config)} "
+        f"Task: {query}"
+    )
+
+
+def _iso_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def _truncate(text: str, max_chars: int, keep_tail: bool = False) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = "\n[truncated]\n"
+    if keep_tail:
+        return marker + text[-max(0, max_chars - len(marker)) :]
+    return text[: max(0, max_chars - len(marker))] + marker
 
 
 class RealtimeVoiceClient:
@@ -313,7 +692,7 @@ class RealtimeConversationSession:
     def __init__(self, config: Config):
         self.config = config
         self.player = PcmPlayer(config.audio_playback_device)
-        self.search_client = OpenAI(api_key=config.openai_api_key, timeout=config.web_search_timeout_seconds)
+        self.tasks = BackgroundTaskManager(config)
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
@@ -363,6 +742,7 @@ class RealtimeConversationSession:
             recorder = self._recorder
             capture_queue = self._capture_queue
 
+        LOGGER.info("starting realtime turn capture")
         recorder.start()
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -382,6 +762,7 @@ class RealtimeConversationSession:
                 daemon=True,
             )
             self._sender_thread.start()
+            LOGGER.info("realtime audio sender started")
         except BaseException:
             self._stop_capture_threads()
             raise
@@ -485,6 +866,7 @@ class RealtimeConversationSession:
             self._tool_active = False
             self._tool_generation += 1
             self._abort_playback_locked()
+            self._reset_turn_text_locked()
         self._stop_capture_threads()
         if ws is not None:
             ws.close()
@@ -508,7 +890,8 @@ class RealtimeConversationSession:
     @property
     def is_responding(self) -> bool:
         with self._state_lock:
-            return self._response_pending or self._response_active or self._tool_active or self._playback is not None
+            realtime_busy = self._response_pending or self._response_active or self._tool_active or self._playback is not None
+        return realtime_busy or self.tasks.has_running()
 
     def pop_completed_turns(self) -> list[RealtimeTurnResult]:
         turns: list[RealtimeTurnResult] = []
@@ -633,6 +1016,9 @@ class RealtimeConversationSession:
 
     def _complete_response_locked(self, response: dict[str, Any]) -> bool:
         status = response.get("status", "")
+        usage = response.get("usage")
+        if usage:
+            LOGGER.info("realtime response usage: %s", usage)
         self._response_pending = False
         self._response_active = False
         self._active_response_id = ""
@@ -643,15 +1029,16 @@ class RealtimeConversationSession:
             self._reset_turn_text_locked()
             return False
 
-        web_search_calls = response_function_calls(response, WEB_SEARCH_TOOL_NAME)
-        if web_search_calls:
+        tool_calls = response_function_calls(response)
+        async_tool_calls = [call for call in tool_calls if call.get("name") in ASYNC_TASK_TOOL_NAMES]
+        if async_tool_calls:
             self._tool_active = True
             self._tool_generation += 1
             generation = self._tool_generation
             threading.Thread(
-                target=self._run_web_search_calls,
-                args=(generation, web_search_calls),
-                name="realtime-web-search",
+                target=self._run_realtime_tool_calls,
+                args=(generation, async_tool_calls),
+                name="realtime-tool-calls",
                 daemon=True,
             ).start()
             return False
@@ -676,13 +1063,13 @@ class RealtimeConversationSession:
             LOGGER.info("model requested realtime session close")
         return requested_close
 
-    def _run_web_search_calls(self, generation: int, calls: list[dict[str, Any]]) -> None:
+    def _run_realtime_tool_calls(self, generation: int, calls: list[dict[str, Any]]) -> None:
         try:
             for call in calls:
-                output = self._execute_web_search_call(call)
+                output = self._execute_realtime_tool_call(call)
                 with self._state_lock:
                     if generation != self._tool_generation or self._ws is None or self._closing:
-                        LOGGER.info("discarding stale web_search result")
+                        LOGGER.info("discarding stale realtime tool result")
                         return
                 self._send(
                     {
@@ -704,50 +1091,34 @@ class RealtimeConversationSession:
                     "type": "response.create",
                     "response": {
                         "output_modalities": ["audio"],
-                        "instructions": realtime_turn_instructions(self.config),
+                        "instructions": (
+                            f"{realtime_turn_instructions(self.config)} "
+                            "If a background task is still running, tell the user briefly and do not wait."
+                        ),
                     },
                 }
             )
         except BaseException as exc:
             self._errors.put(exc)
 
-    def _execute_web_search_call(self, call: dict[str, Any]) -> dict[str, Any]:
-        query = parse_tool_arguments(call).get("query", "").strip()
-        if not query:
-            return {"ok": False, "error": "web_search requires a non-empty query"}
-        LOGGER.info("running web_search tool: %s", query)
-        prompt = (
-            "This request came from a realtime voice chat. "
-            f"{local_context(self.config)} "
-            "Answer the search query concisely for a spoken response. Include source names or URLs when useful. "
-            f"Search query: {query}"
-        )
-        response = self.search_client.responses.create(
-            model=self.config.web_search_model,
-            input=prompt,
-            reasoning={"effort": self.config.web_search_reasoning_effort},
-            tools=[
-                {
-                    "type": "web_search",
-                    "search_context_size": self.config.web_search_context_size,
-                    "user_location": {
-                        "type": "approximate",
-                        "country": self.config.user_country,
-                        "city": self.config.user_city,
-                        "region": self.config.user_region,
-                        "timezone": self.config.user_timezone,
-                    },
-                }
-            ],
-            store=False,
-        )
-        text = getattr(response, "output_text", "") or extract_responses_output_text(response)
-        return {
-            "ok": True,
-            "query": query,
-            "result": text.strip(),
-            "context": local_context(self.config),
-        }
+    def _execute_realtime_tool_call(self, call: dict[str, Any]) -> dict[str, Any]:
+        name = call.get("name", "")
+        arguments = parse_tool_arguments(call)
+        LOGGER.info("running realtime tool %s with args keys=%s", name, sorted(arguments.keys()))
+        if name in {START_TASK_TOOL_NAME, WEB_SEARCH_TOOL_NAME}:
+            query = arguments.get("query", "").strip()
+            title = arguments.get("title", "").strip()
+            return self.tasks.start(query, title=title)
+        if name == LIST_TASKS_TOOL_NAME:
+            return self.tasks.list(include_completed=bool(arguments.get("include_completed", False)))
+        if name == GET_TASK_TOOL_NAME:
+            return self.tasks.get(
+                task_id=arguments.get("task_id", "").strip(),
+                include_result=bool(arguments.get("include_result", True)),
+            )
+        if name == CANCEL_TASK_TOOL_NAME:
+            return self.tasks.cancel(arguments.get("task_id", "").strip())
+        return {"ok": False, "error": f"unknown realtime tool: {name}"}
 
     def _write_output_audio_locked(self, chunk: bytes) -> None:
         if not chunk:
@@ -759,7 +1130,8 @@ class RealtimeConversationSession:
         self._output_audio_bytes += len(chunk)
 
     def _interrupt_response_locked(self) -> None:
-        if self._response_pending or self._response_active:
+        ws_is_open = self._ws is not None
+        if ws_is_open and (self._response_pending or self._response_active):
             self._send(
                 {
                     "event_id": f"cancel_{time.monotonic_ns()}",
@@ -767,7 +1139,7 @@ class RealtimeConversationSession:
                 }
             )
         self._abort_playback_locked()
-        if self._output_item_id and self._output_audio_bytes:
+        if ws_is_open and self._output_item_id and self._output_audio_bytes:
             audio_end_ms = int(self._output_audio_bytes / 2 / 24000 * 1000)
             self._send(
                 {
@@ -778,11 +1150,15 @@ class RealtimeConversationSession:
                     "audio_end_ms": max(0, audio_end_ms),
                 }
             )
+        elif self._output_item_id and self._output_audio_bytes:
+            LOGGER.info("skipping audio truncate because realtime session is already closed")
         self._response_pending = False
         self._response_active = False
         self._active_response_id = ""
         self._tool_active = False
         self._tool_generation += 1
+        self._output_item_id = ""
+        self._output_audio_bytes = 0
 
     def _abort_playback_locked(self) -> None:
         if self._playback is None:
@@ -869,11 +1245,11 @@ def response_requested_close(response: dict[str, Any]) -> bool:
     return bool(response_function_calls(response, CLOSE_TOOL_NAME))
 
 
-def response_function_calls(response: dict[str, Any], name: str) -> list[dict[str, Any]]:
+def response_function_calls(response: dict[str, Any], name: str | None = None) -> list[dict[str, Any]]:
     return [
         item
         for item in response.get("output", [])
-        if item.get("type") == "function_call" and item.get("name") == name
+        if item.get("type") == "function_call" and (name is None or item.get("name") == name)
     ]
 
 

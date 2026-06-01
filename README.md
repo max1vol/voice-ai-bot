@@ -12,13 +12,13 @@ Behavior:
 - Double-click the button to clear the saved conversation.
 - Conversation history is persisted as JSON on the Pi.
 - Realtime turns include the current local time and user context for Cambridge, UK.
-- The realtime model has a `web_search` function backed by GPT-5.5 with hosted web search for current or local facts.
+- The realtime model has background task tools backed by GPT-5.5 with hosted web search, reasoning summaries, and hosted code interpreter for current facts, calculations, and code work.
 - Before calling OpenAI, the daemon waits for DNS and TCP connectivity to `api.openai.com`; this avoids losing the first turn while Wi-Fi is still settling after boot.
 
 Two backends are available:
 
 - `VOICE_BOT_BACKEND=responses`: the original flow, using speech-to-text, GPT-5.5, and TTS.
-- `VOICE_BOT_BACKEND=realtime`: a persistent push-to-talk WebSocket session using `gpt-realtime-2`. It disables VAD, streams PCM from the mic while the button is held, streams PCM audio back to the speaker, supports button barge-in, and closes on idle timeout, hard session timeout, double-click, or when the model calls `close_realtime_session`.
+- `VOICE_BOT_BACKEND=realtime`: a persistent push-to-talk WebSocket session using `gpt-realtime-2`. It disables VAD, streams PCM from the mic while the button is held, streams PCM audio back to the speaker, supports button barge-in, can start/list/inspect/cancel background GPT-5.5 tasks, and closes on idle timeout, hard session timeout, double-click, or when the model calls `close_realtime_session`.
 
 ## Hardware Defaults
 
@@ -59,6 +59,10 @@ USER_COUNTRY=GB
 USER_TIMEZONE=Europe/London
 WEB_SEARCH_MODEL=gpt-5.5
 WEB_SEARCH_REASONING_EFFORT=medium
+TASK_MODEL=gpt-5.5
+TASK_REASONING_EFFORT=medium
+TASK_REASONING_SUMMARY=auto
+TASK_CODE_EXECUTION=true
 ```
 
 The service intentionally keeps secrets out of git. `.env` is copied to the Pi during install but is ignored locally and remotely.
