@@ -23,6 +23,7 @@ from openai import OpenAI
 from .audio_io import PcmOutputStream, PcmPlayer, RawPcmRecorder
 from .config import Config, REALTIME_SYSTEM_PROMPT
 from .conversation import Message
+from .memory import MemoryStore
 from .scheduled_tasks import ScheduledTaskStore
 
 LOGGER = logging.getLogger(__name__)
@@ -37,6 +38,12 @@ CANCEL_TASK_TOOL_NAME = "cancel_background_task"
 ADD_SCHEDULED_TASK_TOOL_NAME = "add_scheduled_task"
 LIST_SCHEDULED_TASKS_TOOL_NAME = "list_scheduled_tasks"
 DELETE_SCHEDULED_TASK_TOOL_NAME = "delete_scheduled_task"
+MEMORY_SEARCH_TOOL_NAME = "memory_search"
+MEMORY_LIST_TOOL_NAME = "memory_list"
+MEMORY_ADD_TOOL_NAME = "memory_add"
+MEMORY_UPDATE_TOOL_NAME = "memory_update"
+MEMORY_FORGET_TOOL_NAME = "memory_forget"
+MEMORY_GET_SOURCE_TOOL_NAME = "memory_get_source"
 ASYNC_TASK_TOOL_NAMES = {
     START_TASK_TOOL_NAME,
     LIST_TASKS_TOOL_NAME,
@@ -46,6 +53,12 @@ ASYNC_TASK_TOOL_NAMES = {
     ADD_SCHEDULED_TASK_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
+    MEMORY_SEARCH_TOOL_NAME,
+    MEMORY_LIST_TOOL_NAME,
+    MEMORY_ADD_TOOL_NAME,
+    MEMORY_UPDATE_TOOL_NAME,
+    MEMORY_FORGET_TOOL_NAME,
+    MEMORY_GET_SOURCE_TOOL_NAME,
 }
 
 
@@ -90,14 +103,18 @@ def local_context(config: Config) -> str:
     )
 
 
-def realtime_session_instructions(config: Config) -> str:
-    return (
+def realtime_session_instructions(config: Config, memory_context: str = "") -> str:
+    parts = [
         f"{REALTIME_SYSTEM_PROMPT} "
         f"The user is in {config.user_city}, {config.user_region}, {config.user_country}. "
         "For each response, the application will provide current local time and location context. "
+        "Use the user's current local time, date, timezone, and location for words like today, tomorrow, "
+        "local, nearby, morning, evening, and current. "
         "Use start_background_task when the user asks about current, recent, local, weather, news, opening-hours, "
         "price, schedule, or otherwise time-sensitive facts. Prefer the background task tools for web, code, "
         "calculation, or multi-step research so the voice session stays interruptible. "
+        "Background GPT-5.5 tasks receive the user's current local time, timezone, and location, and can use "
+        "hosted web search plus code execution. "
         "When start_background_task returns a running task, briefly tell the user it started instead of polling "
         "repeatedly in the same response. Set wakeup_on_complete true when the user expects the final answer "
         "to be spoken automatically after the task finishes; set it false for tasks the user only wants to check later. "
@@ -107,16 +124,26 @@ def realtime_session_instructions(config: Config) -> str:
         "Use the scheduled-task tools for that. Spoken scheduled tasks must not start during quiet hours "
         f"{config.schedule_quiet_start}-{config.schedule_quiet_end} local time; if the requested time falls there, "
         "explain that the device will stay quiet then and ask for another time. "
+        "Use memory_search or memory_list before answering questions about what you remember, prior conversations, "
+        "user preferences, personal facts, or saved decisions. If the user asks you to remember something, call "
+        "memory_add. If the user says memory is wrong, call memory_update. If the user asks to forget/delete/remove "
+        "memory, call memory_forget. Confirm memory changes briefly. Do not store secrets or credentials. "
         "If interrupted by a new button press, stop the previous reply and treat the new speech as the latest user turn."
-    )
+    ]
+    if memory_context.strip():
+        parts.append("\n\nPersistent workspace context:\n" + memory_context.strip())
+    return " ".join(parts)
 
 
-def realtime_turn_instructions(config: Config) -> str:
-    return (
+def realtime_turn_instructions(config: Config, memory_context: str = "") -> str:
+    parts = [
         f"{local_context(config)} "
         "Answer the latest user turn. Keep spoken replies concise. "
         "Use background and scheduled-task tools when they fit the user's request."
-    )
+    ]
+    if memory_context.strip():
+        parts.append(memory_context.strip())
+    return " ".join(parts)
 
 
 def realtime_tools() -> list[dict[str, Any]]:
@@ -285,6 +312,131 @@ def realtime_tools() -> list[dict[str, Any]]:
                     }
                 },
                 "required": ["task_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": MEMORY_SEARCH_TOOL_NAME,
+            "description": (
+                "Search Max Code's persisted memory before answering questions about previous conversations, "
+                "stored user facts, preferences, decisions, or what the assistant remembers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query in the user's words.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of memory snippets to return.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "type": "function",
+            "name": MEMORY_LIST_TOOL_NAME,
+            "description": "List durable long-term memory entries so the user can review them.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_forgotten": {
+                        "type": "boolean",
+                        "description": "Include entries that were explicitly forgotten.",
+                    }
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": MEMORY_ADD_TOOL_NAME,
+            "description": (
+                "Add a durable memory entry when the user explicitly asks to remember something, or when they "
+                "clearly approve saving a stable preference or fact."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The durable fact, preference, or instruction to remember.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Short category such as preference, fact, instruction, project, or note.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+        {
+            "type": "function",
+            "name": MEMORY_UPDATE_TOOL_NAME,
+            "description": "Correct an existing durable memory entry when the user says it is wrong or outdated.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry_id": {
+                        "type": "string",
+                        "description": "Memory entry id returned by memory_list or memory_search.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Replacement memory text.",
+                    },
+                },
+                "required": ["entry_id", "text"],
+            },
+        },
+        {
+            "type": "function",
+            "name": MEMORY_FORGET_TOOL_NAME,
+            "description": (
+                "Forget a durable memory entry when the user asks to delete, remove, or forget it. Use entry_id "
+                "when available; otherwise use query to match active entries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry_id": {
+                        "type": "string",
+                        "description": "Memory entry id to forget.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Fallback text to match against active memory entries.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief user-facing reason, if any.",
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": MEMORY_GET_SOURCE_TOOL_NAME,
+            "description": "Read a bounded excerpt from a memory source path returned by memory_search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Memory path returned by memory_search, such as MEMORY.md or memory/YYYY-MM-DD.md.",
+                    },
+                    "from_line": {
+                        "type": "integer",
+                        "description": "1-based line number to start reading.",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of lines to read.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     ]
@@ -584,8 +736,11 @@ def background_task_instructions(config: Config) -> str:
     return (
         "You are a background research and code-execution worker for a realtime voice assistant. "
         "Use web_search for current, local, or source-dependent facts. Use code_interpreter for calculations, "
-        "small programs, data processing, or checking code. Produce a concise final answer suitable for the "
-        "voice assistant to summarize aloud, with source names or URLs when web facts matter. "
+        "small programs, data processing, writing code, or checking code. Interpret relative dates like today, "
+        "tomorrow, this morning, and tonight using the user's local timezone from the context. For web results, "
+        "prefer sources relevant to the user's location and current local date when the query is local or time-sensitive. "
+        "Produce a concise final answer suitable for the voice assistant to summarize aloud, with source names or URLs "
+        "when web facts matter. "
         f"{local_context(config)}"
     )
 
@@ -594,7 +749,9 @@ def background_task_prompt(config: Config, query: str) -> str:
     return (
         "This task was started from a live push-to-talk Realtime conversation. "
         "Work independently and stream reasoning summaries so the voice model can report progress. "
-        f"{local_context(config)} "
+        "Use hosted web search for current facts and code_interpreter for calculations, code generation, code execution, "
+        "or verification. Treat the following local context as authoritative for 'today', 'now', local weather, events, "
+        f"and schedules. {local_context(config)} "
         f"Task: {query}"
     )
 
@@ -659,12 +816,12 @@ class RealtimeVoiceClient:
             timeout=self.config.realtime_response_timeout_seconds,
         )
 
-    def _send_session_update(self, ws: websocket.WebSocket) -> None:
+    def _send_session_update(self, ws: websocket.WebSocket, memory_context: str = "") -> None:
         session: dict[str, Any] = {
             "type": "realtime",
             "model": self.config.realtime_model,
             "output_modalities": ["audio"],
-            "instructions": realtime_session_instructions(self.config),
+            "instructions": realtime_session_instructions(self.config, memory_context),
             "audio": {
                 "input": {
                     "format": {
@@ -811,11 +968,18 @@ class RealtimeVoiceClient:
 
 
 class RealtimeConversationSession:
-    def __init__(self, config: Config, scheduled_tasks: ScheduledTaskStore | None = None):
+    def __init__(
+        self,
+        config: Config,
+        scheduled_tasks: ScheduledTaskStore | None = None,
+        memory: MemoryStore | None = None,
+    ):
         self.config = config
         self.player = PcmPlayer(config.audio_playback_device)
         self.tasks = BackgroundTaskManager(config)
         self.scheduled_tasks = scheduled_tasks or ScheduledTaskStore(config)
+        self.memory = memory or MemoryStore(config)
+        self.memory.ensure_workspace()
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
@@ -837,12 +1001,17 @@ class RealtimeConversationSession:
         self._sent_audio_bytes = 0
 
         self._response_pending = False
+        self._response_create_pending = False
         self._response_active = False
         self._response_wait_started_at = 0.0
+        self._waiting_for_input_transcript = False
         self._tool_active = False
         self._tool_generation = 0
+        self._turn_generation = 0
+        self._pending_input_generation = 0
         self._active_response_id = ""
         self._playback: PcmOutputStream | None = None
+        self._playback_closing = False
         self._output_item_id = ""
         self._output_audio_bytes = 0
         self._input_transcript_parts: list[str] = []
@@ -856,7 +1025,8 @@ class RealtimeConversationSession:
             if self._recorder is not None:
                 raise RuntimeError("realtime recording is already active")
             self._last_activity_at = time.monotonic()
-            self._abort_playback_locked()
+            self._interrupt_response_locked()
+            self._reset_turn_text_locked()
             self._recorder = RawPcmRecorder(self.config)
             self._capture_queue = queue.Queue()
             self._capture_bytes = 0
@@ -876,9 +1046,6 @@ class RealtimeConversationSession:
         self._capture_thread.start()
 
         try:
-            with self._state_lock:
-                self._interrupt_response_locked()
-                self._reset_turn_text_locked()
             self.ensure_open(history)
             self._send({"type": "input_audio_buffer.clear"})
             self._sender_thread = threading.Thread(
@@ -904,20 +1071,15 @@ class RealtimeConversationSession:
             self.clear_pending_input()
             raise RuntimeError("no audio was captured for realtime turn")
         self._send({"type": "input_audio_buffer.commit"})
-        self._send(
-            {
-                "type": "response.create",
-                "response": {
-                    "output_modalities": ["audio"],
-                    "instructions": realtime_turn_instructions(self.config),
-                },
-            }
-        )
         with self._state_lock:
+            self._turn_generation += 1
+            self._pending_input_generation = self._turn_generation
             self._response_pending = True
+            self._response_create_pending = False
+            self._waiting_for_input_transcript = True
             self._response_wait_started_at = time.monotonic()
             self._last_activity_at = time.monotonic()
-        LOGGER.info("committed realtime turn: %d PCM bytes", sent_audio_bytes)
+        LOGGER.info("committed realtime turn: %d PCM bytes; waiting for transcript", sent_audio_bytes)
 
     def end_turn(self, commit: bool) -> float:
         duration = self._stop_capture_threads()
@@ -943,7 +1105,7 @@ class RealtimeConversationSession:
         ws = RealtimeVoiceClient(self.config)._connect()
         deadline = time.monotonic() + self.config.realtime_response_timeout_seconds
         try:
-            RealtimeVoiceClient(self.config)._send_session_update(ws)
+            RealtimeVoiceClient(self.config)._send_session_update(ws, self.memory.bootstrap_context())
             RealtimeVoiceClient(self.config)._wait_for_session_updated(ws, deadline)
             RealtimeVoiceClient(self.config)._seed_history(ws, history)
         except BaseException:
@@ -984,6 +1146,9 @@ class RealtimeConversationSession:
         cooldown = self.config.realtime_silent_cooldown_seconds
         if cooldown <= 0:
             return
+        should_start_response = False
+        fallback_query = ""
+        generation = 0
         with self._state_lock:
             if self._ws is None or self._recorder is not None:
                 return
@@ -993,11 +1158,22 @@ class RealtimeConversationSession:
                 return
             wait_started_at = self._response_wait_started_at or self._last_activity_at
             silent_for = time.monotonic() - wait_started_at
-            if silent_for < cooldown:
+            if self._waiting_for_input_transcript and silent_for >= min(2.0, cooldown):
+                LOGGER.info("starting realtime response before final transcript after %.1fs", silent_for)
+                self._waiting_for_input_transcript = False
+                generation = self._pending_input_generation
+                fallback_query = self._input_transcript_final or "".join(self._input_transcript_parts).strip()
+                should_start_response = True
+            elif self._waiting_for_input_transcript:
                 return
-            LOGGER.info("cooling down silent realtime response after %.1fs", silent_for)
-            self._interrupt_response_locked()
-            self._reset_turn_text_locked()
+            if not should_start_response and silent_for < cooldown:
+                return
+            if not should_start_response:
+                LOGGER.info("cooling down silent realtime response after %.1fs", silent_for)
+                self._interrupt_response_locked()
+                self._reset_turn_text_locked()
+        if should_start_response:
+            self._start_response_for_current_turn(fallback_query, generation)
 
     def close(self) -> None:
         receiver_thread: threading.Thread | None
@@ -1008,8 +1184,10 @@ class RealtimeConversationSession:
             receiver_thread = self._receiver_thread
             self._receiver_thread = None
             self._response_pending = False
+            self._response_create_pending = False
             self._response_active = False
             self._response_wait_started_at = 0.0
+            self._waiting_for_input_transcript = False
             self._tool_active = False
             self._tool_generation += 1
             self._abort_playback_locked()
@@ -1134,6 +1312,7 @@ class RealtimeConversationSession:
                 return False
             RealtimeVoiceClient(self.config)._raise_for_error(event)
 
+        audio_chunk: bytes | None = None
         with self._state_lock:
             self._last_activity_at = time.monotonic()
 
@@ -1143,31 +1322,75 @@ class RealtimeConversationSession:
                 self._input_transcript_final = event.get("transcript", "").strip()
                 if self._input_transcript_final:
                     LOGGER.info("realtime input transcript: %s", self._input_transcript_final)
+                should_start_response = self._waiting_for_input_transcript
+                self._waiting_for_input_transcript = False
+                generation = self._pending_input_generation
+                transcript = self._input_transcript_final or "".join(self._input_transcript_parts).strip()
+                if should_start_response:
+                    threading.Thread(
+                        target=self._start_response_for_current_turn,
+                        args=(transcript, generation),
+                        name="realtime-active-memory",
+                        daemon=True,
+                    ).start()
             elif event_type == "response.created":
                 response = event.get("response", {})
+                if self._recorder is not None or not self._response_create_pending:
+                    LOGGER.info("ignoring stale realtime response.created while not waiting for output")
+                    return False
+                self._response_create_pending = False
                 self._response_pending = False
                 self._response_active = True
                 self._active_response_id = response.get("id", "")
                 if not self._response_wait_started_at:
                     self._response_wait_started_at = time.monotonic()
             elif event_type in {"response.output_item.created", "response.output_item.added"}:
+                if not self._is_current_response_event_locked(event):
+                    return False
                 item = event.get("item", {})
                 if item.get("type") == "message":
                     self._output_item_id = item.get("id", "")
                     self._output_audio_bytes = 0
             elif event_type == "response.output_audio.delta":
+                if not self._is_current_response_event_locked(event):
+                    return False
                 self._response_wait_started_at = 0.0
-                self._write_output_audio_locked(base64.b64decode(event.get("delta", "")))
+                audio_chunk = base64.b64decode(event.get("delta", ""))
             elif event_type == "response.output_audio_transcript.delta":
+                if not self._is_current_response_event_locked(event):
+                    return False
                 self._response_wait_started_at = 0.0
                 self._output_transcript_parts.append(event.get("delta", ""))
             elif event_type == "response.output_audio_transcript.done":
+                if not self._is_current_response_event_locked(event):
+                    return False
                 self._output_transcript_final = event.get("transcript", "").strip()
                 if self._output_transcript_final:
                     LOGGER.info("realtime assistant transcript: %s", self._output_transcript_final)
             elif event_type == "response.done":
+                if not self._is_current_response_event_locked(event):
+                    return False
                 return self._complete_response_locked(event.get("response", {}))
+        if audio_chunk:
+            self._write_output_audio(audio_chunk)
         return False
+
+    def _is_current_response_event_locked(self, event: dict[str, Any]) -> bool:
+        if self._recorder is not None:
+            LOGGER.info("ignoring realtime response event while recording: %s", event.get("type"))
+            return False
+        if not self._response_active:
+            LOGGER.info("ignoring realtime response event without an active response: %s", event.get("type"))
+            return False
+        response = event.get("response") if isinstance(event.get("response"), dict) else {}
+        response_id = str(event.get("response_id") or response.get("id") or "").strip()
+        if response_id and self._active_response_id and response_id != self._active_response_id:
+            LOGGER.info("ignoring stale realtime response event for %s", response_id)
+            return False
+        if response_id and not self._active_response_id and event.get("type") != "response.created":
+            LOGGER.info("ignoring realtime response event before active response id is known: %s", response_id)
+            return False
+        return True
 
     def _complete_response_locked(self, response: dict[str, Any]) -> bool:
         status = response.get("status", "")
@@ -1175,8 +1398,10 @@ class RealtimeConversationSession:
         if usage:
             LOGGER.info("realtime response usage: %s", usage)
         self._response_pending = False
+        self._response_create_pending = False
         self._response_active = False
         self._response_wait_started_at = 0.0
+        self._waiting_for_input_transcript = False
         self._active_response_id = ""
         self._close_playback_locked(check=True)
 
@@ -1243,6 +1468,7 @@ class RealtimeConversationSession:
                     return
                 self._tool_active = False
                 self._response_pending = True
+                self._response_create_pending = True
                 self._response_wait_started_at = time.monotonic()
             self._send(
                 {
@@ -1259,36 +1485,112 @@ class RealtimeConversationSession:
         except BaseException as exc:
             self._errors.put(exc)
 
+    def _start_response_for_current_turn(self, query: str = "", generation: int = 0) -> None:
+        try:
+            with self._state_lock:
+                if (
+                    self._ws is None
+                    or self._closing
+                    or self._recorder is not None
+                    or generation != self._pending_input_generation
+                ):
+                    return
+            memory_context = self.memory.active_context(query) if query.strip() else ""
+            with self._state_lock:
+                if (
+                    self._ws is None
+                    or self._closing
+                    or self._recorder is not None
+                    or generation != self._pending_input_generation
+                ):
+                    LOGGER.info("discarding stale realtime response start")
+                    return
+                self._response_pending = True
+                self._response_create_pending = True
+                self._response_wait_started_at = time.monotonic()
+                self._last_activity_at = time.monotonic()
+                self._send(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "output_modalities": ["audio"],
+                            "instructions": realtime_turn_instructions(self.config, memory_context),
+                        },
+                    }
+                )
+            LOGGER.info(
+                "started realtime response with active memory chars=%d",
+                len(memory_context),
+            )
+        except BaseException as exc:
+            self._errors.put(exc)
+
     def _execute_realtime_tool_call(self, call: dict[str, Any]) -> dict[str, Any]:
         name = call.get("name", "")
         arguments = parse_tool_arguments(call)
         LOGGER.info("running realtime tool %s with args keys=%s", name, sorted(arguments.keys()))
         if name in {START_TASK_TOOL_NAME, WEB_SEARCH_TOOL_NAME}:
-            query = arguments.get("query", "").strip()
-            title = arguments.get("title", "").strip()
+            query = string_argument(arguments, "query")
+            title = string_argument(arguments, "title")
             wakeup_on_complete = parse_bool_argument(arguments.get("wakeup_on_complete"), default=False)
             return self.tasks.start(query, title=title, wakeup_on_complete=wakeup_on_complete)
         if name == LIST_TASKS_TOOL_NAME:
-            return self.tasks.list(include_completed=bool(arguments.get("include_completed", False)))
+            return self.tasks.list(
+                include_completed=parse_bool_argument(arguments.get("include_completed"), default=False)
+            )
         if name == GET_TASK_TOOL_NAME:
             return self.tasks.get(
-                task_id=arguments.get("task_id", "").strip(),
-                include_result=bool(arguments.get("include_result", True)),
+                task_id=string_argument(arguments, "task_id"),
+                include_result=parse_bool_argument(arguments.get("include_result"), default=True),
             )
         if name == CANCEL_TASK_TOOL_NAME:
-            return self.tasks.cancel(arguments.get("task_id", "").strip())
+            return self.tasks.cancel(string_argument(arguments, "task_id"))
         if name == ADD_SCHEDULED_TASK_TOOL_NAME:
             return self.scheduled_tasks.add(
-                title=arguments.get("title", ""),
-                prompt=arguments.get("prompt", ""),
-                run_at=arguments.get("run_at", ""),
-                action=arguments.get("action", "speak"),
-                repeat=arguments.get("repeat", "once"),
+                title=string_argument(arguments, "title"),
+                prompt=string_argument(arguments, "prompt"),
+                run_at=string_argument(arguments, "run_at"),
+                action=string_argument(arguments, "action", "speak"),
+                repeat=string_argument(arguments, "repeat", "once"),
             )
         if name == LIST_SCHEDULED_TASKS_TOOL_NAME:
-            return self.scheduled_tasks.list(include_inactive=bool(arguments.get("include_inactive", False)))
+            return self.scheduled_tasks.list(
+                include_inactive=parse_bool_argument(arguments.get("include_inactive"), default=False)
+            )
         if name == DELETE_SCHEDULED_TASK_TOOL_NAME:
-            return self.scheduled_tasks.delete(arguments.get("task_id", "").strip())
+            return self.scheduled_tasks.delete(string_argument(arguments, "task_id"))
+        if name == MEMORY_SEARCH_TOOL_NAME:
+            return self.memory.search(
+                string_argument(arguments, "query"),
+                max_results=int_argument(arguments, "max_results", 5),
+            )
+        if name == MEMORY_LIST_TOOL_NAME:
+            return self.memory.list_entries(
+                include_forgotten=parse_bool_argument(arguments.get("include_forgotten"), default=False)
+            )
+        if name == MEMORY_ADD_TOOL_NAME:
+            return self.memory.add_entry(
+                text=string_argument(arguments, "text"),
+                kind=string_argument(arguments, "kind", "note"),
+                source="user",
+            )
+        if name == MEMORY_UPDATE_TOOL_NAME:
+            return self.memory.update_entry(
+                entry_id=string_argument(arguments, "entry_id"),
+                text=string_argument(arguments, "text"),
+            )
+        if name == MEMORY_FORGET_TOOL_NAME:
+            return self.memory.forget_entry(
+                entry_id=string_argument(arguments, "entry_id"),
+                query=string_argument(arguments, "query"),
+                reason=string_argument(arguments, "reason"),
+            )
+        if name == MEMORY_GET_SOURCE_TOOL_NAME:
+            return self.memory.get_source(
+                path=string_argument(arguments, "path"),
+                from_line=int_argument(arguments, "from_line", 1),
+                lines=int_argument(arguments, "lines", 12),
+            )
         return {"ok": False, "error": f"unknown realtime tool: {name}"}
 
     def trigger_scheduled_speech(self, history: Iterable[Message], title: str, prompt: str) -> bool:
@@ -1324,6 +1626,11 @@ class RealtimeConversationSession:
                 },
             }
         )
+        with self._state_lock:
+            self._response_pending = True
+            self._response_create_pending = True
+            self._response_wait_started_at = time.monotonic()
+            self._last_activity_at = time.monotonic()
         self._send(
             {
                 "type": "response.create",
@@ -1337,10 +1644,6 @@ class RealtimeConversationSession:
                 },
             }
         )
-        with self._state_lock:
-            self._response_pending = True
-            self._response_wait_started_at = time.monotonic()
-            self._last_activity_at = time.monotonic()
         LOGGER.info("started scheduled speech: %s", title)
         return True
 
@@ -1383,6 +1686,11 @@ class RealtimeConversationSession:
                 },
             }
         )
+        with self._state_lock:
+            self._response_pending = True
+            self._response_create_pending = True
+            self._response_wait_started_at = time.monotonic()
+            self._last_activity_at = time.monotonic()
         self._send(
             {
                 "type": "response.create",
@@ -1396,24 +1704,27 @@ class RealtimeConversationSession:
                 },
             }
         )
-        with self._state_lock:
-            self._response_pending = True
-            self._response_wait_started_at = time.monotonic()
-            self._last_activity_at = time.monotonic()
         LOGGER.info("started background task wakeup for %s", task_id)
         return True
 
-    def _write_output_audio_locked(self, chunk: bytes) -> None:
+    def _write_output_audio(self, chunk: bytes) -> None:
         if not chunk:
             return
-        if self._recorder is not None:
-            self._output_audio_bytes += len(chunk)
-            return
-        if self._playback is None:
-            self._playback = self.player.open_stream(rate=24000, channels=1)
-            self._playback.__enter__()
-        self._playback.write(chunk)
-        self._output_audio_bytes += len(chunk)
+        with self._state_lock:
+            if self._recorder is not None:
+                self._output_audio_bytes += len(chunk)
+                return
+            if self._playback is None:
+                self._playback = self.player.open_stream(rate=24000, channels=1)
+                self._playback.__enter__()
+                self._playback_closing = False
+            if self._playback_closing:
+                return
+            playback = self._playback
+        playback.write(chunk)
+        with self._state_lock:
+            if self._playback is playback and not self._playback_closing:
+                self._output_audio_bytes += len(chunk)
 
     def _interrupt_response_locked(self) -> None:
         ws_is_open = self._ws is not None
@@ -1439,26 +1750,47 @@ class RealtimeConversationSession:
         elif self._output_item_id and self._output_audio_bytes:
             LOGGER.info("skipping audio truncate because realtime session is already closed")
         self._response_pending = False
+        self._response_create_pending = False
         self._response_active = False
         self._response_wait_started_at = 0.0
+        self._waiting_for_input_transcript = False
         self._active_response_id = ""
         self._tool_active = False
         self._tool_generation += 1
+        self._turn_generation += 1
+        self._pending_input_generation = self._turn_generation
         self._output_item_id = ""
         self._output_audio_bytes = 0
 
     def _abort_playback_locked(self) -> None:
-        if self._playback is None:
+        playback = self._playback
+        if playback is None:
             return
-        self._playback.abort()
-        self._playback.close(check=False)
         self._playback = None
+        self._playback_closing = False
+        playback.abort()
+        self._close_playback_in_background(playback, check=False)
+
+    def _close_playback_in_background(self, playback: PcmOutputStream, check: bool) -> None:
+        def close_playback() -> None:
+            try:
+                playback.close(check=check)
+            except BaseException:
+                LOGGER.exception("PCM playback close failed")
+            finally:
+                with self._state_lock:
+                    if self._playback is playback:
+                        self._playback = None
+                        self._playback_closing = False
+
+        threading.Thread(target=close_playback, name="pcm-playback-close", daemon=True).start()
 
     def _close_playback_locked(self, check: bool) -> None:
-        if self._playback is None:
+        playback = self._playback
+        if playback is None or self._playback_closing:
             return
-        self._playback.close(check=check)
-        self._playback = None
+        self._playback_closing = True
+        self._close_playback_in_background(playback, check=check)
 
     def _reset_turn_text_locked(self) -> None:
         self._input_transcript_parts = []
@@ -1547,6 +1879,24 @@ def parse_tool_arguments(call: dict[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def string_argument(arguments: dict[str, Any], name: str, default: str = "") -> str:
+    value = arguments.get(name, default)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def int_argument(arguments: dict[str, Any], name: str, default: int) -> int:
+    value = arguments.get(name, default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
 
 
 def parse_bool_argument(value: Any, default: bool = False) -> bool:

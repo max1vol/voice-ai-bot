@@ -8,19 +8,18 @@ from dotenv import load_dotenv
 
 
 SYSTEM_PROMPT = (
-    "You are a voice assistant running on a small push-to-talk speaker. "
+    "Your name is Max Code. You are a voice assistant running on a small push-to-talk speaker. "
     "The user's language is either English or Russian and is unlikely to be any other language. "
     "Reply in the same language as the user's latest request unless they ask otherwise. "
     "Keep replies concise, natural, and suitable for being spoken aloud."
 )
 
 REALTIME_SYSTEM_PROMPT = (
-    "You are a push-to-talk English/Russian voice translator and assistant running on a small speaker. "
+    "Your name is Max Code. You are a push-to-talk English/Russian voice assistant running on a small speaker. "
     "The user's language is either English or Russian and is unlikely to be any other language. "
-    "Default to directional translation: translate English speech into Russian and Russian speech into English, "
-    "speaking only the translation. If the user clearly asks a question or asks for assistant behavior instead of "
-    "translation, answer concisely in the requested language. If the user asks you to stop, close, disconnect, sleep, "
-    "or end the session, call the close_realtime_session tool."
+    "Be an assistant first: answer questions and follow commands concisely in the user's language. "
+    "Translate only when the user asks for translation or clearly starts a translation task. "
+    "If the user asks you to stop, close, disconnect, sleep, or end the session, call the close_realtime_session tool."
 )
 
 
@@ -98,6 +97,9 @@ class Config:
     recordings_dir: Path
     tts_chunk_chars: int
     log_level: str
+    memory_dir: Path = Path("/var/lib/voice-ai-bot/agent")
+    memory_bootstrap_chars: int = 12000
+    memory_active_context_chars: int = 1800
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -114,7 +116,7 @@ class Config:
             openai_api_key=api_key,
             voice_bot_backend=backend,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
-            openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low"),
+            openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "high"),
             openai_connectivity_host=os.getenv("OPENAI_CONNECTIVITY_HOST", "api.openai.com"),
             openai_connectivity_wait_seconds=_float_env("OPENAI_CONNECTIVITY_WAIT_SECONDS", 120.0),
             openai_timeout_seconds=_float_env("OPENAI_TIMEOUT_SECONDS", 120.0),
@@ -126,7 +128,7 @@ class Config:
                 "Speak naturally. Match the user's language. Keep the response clear and comfortable to listen to.",
             ),
             realtime_model=os.getenv("REALTIME_MODEL", "gpt-realtime-2"),
-            realtime_reasoning_effort=os.getenv("REALTIME_REASONING_EFFORT", "low"),
+            realtime_reasoning_effort=os.getenv("REALTIME_REASONING_EFFORT", "medium"),
             realtime_voice=os.getenv("REALTIME_VOICE", "marin"),
             realtime_input_rate=realtime_input_rate,
             realtime_input_transcription_model=os.getenv("REALTIME_INPUT_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
@@ -141,12 +143,12 @@ class Config:
             user_country=os.getenv("USER_COUNTRY", "GB"),
             user_timezone=os.getenv("USER_TIMEZONE", "Europe/London"),
             web_search_model=os.getenv("WEB_SEARCH_MODEL", "gpt-5.5"),
-            web_search_reasoning_effort=os.getenv("WEB_SEARCH_REASONING_EFFORT", "medium"),
+            web_search_reasoning_effort=os.getenv("WEB_SEARCH_REASONING_EFFORT", "high"),
             web_search_context_size=os.getenv("WEB_SEARCH_CONTEXT_SIZE", "medium"),
             web_search_timeout_seconds=_float_env("WEB_SEARCH_TIMEOUT_SECONDS", 90.0),
             task_model=os.getenv("TASK_MODEL", os.getenv("WEB_SEARCH_MODEL", "gpt-5.5")),
             task_reasoning_effort=os.getenv(
-                "TASK_REASONING_EFFORT", os.getenv("WEB_SEARCH_REASONING_EFFORT", "medium")
+                "TASK_REASONING_EFFORT", os.getenv("WEB_SEARCH_REASONING_EFFORT", "high")
             ),
             task_reasoning_summary=os.getenv("TASK_REASONING_SUMMARY", "auto"),
             task_timeout_seconds=_float_env("TASK_TIMEOUT_SECONDS", 180.0),
@@ -173,4 +175,7 @@ class Config:
             recordings_dir=Path(os.getenv("RECORDINGS_DIR", "/var/lib/voice-ai-bot/recordings")),
             tts_chunk_chars=_int_env("TTS_CHUNK_CHARS", 240),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            memory_dir=Path(os.getenv("MEMORY_DIR", "/var/lib/voice-ai-bot/agent")),
+            memory_bootstrap_chars=_int_env("MEMORY_BOOTSTRAP_CHARS", 12000),
+            memory_active_context_chars=_int_env("MEMORY_ACTIVE_CONTEXT_CHARS", 1800),
         )

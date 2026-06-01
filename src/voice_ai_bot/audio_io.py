@@ -136,23 +136,34 @@ class PcmOutputStream:
                 return
             if self.process is None or self.process.stdin is None:
                 raise RuntimeError("PCM output stream is not open")
-            self.process.stdin.write(chunk)
-            self.process.stdin.flush()
+            stdin = self.process.stdin
+        try:
+            stdin.write(chunk)
+            stdin.flush()
+        except (BrokenPipeError, OSError):
+            with self._lock:
+                if self._aborted:
+                    return
+            raise
+        with self._lock:
+            if self._aborted:
+                return
             self.bytes_written += len(chunk)
 
     def abort(self) -> None:
         with self._lock:
             self._aborted = True
             process = self.process
-            if process is None:
-                return
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-            if process.poll() is None:
-                process.terminate()
+            stdin = process.stdin if process is not None else None
+        if process is None:
+            return
+        if stdin is not None:
+            try:
+                stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        if process.poll() is None:
+            process.terminate()
 
     def close(self, check: bool = True) -> None:
         with self._lock:

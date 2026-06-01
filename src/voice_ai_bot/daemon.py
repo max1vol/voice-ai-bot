@@ -12,6 +12,7 @@ from .audio_io import Recorder
 from .config import Config
 from .conversation import ConversationStore
 from .hardware import HatHardware
+from .memory import MemoryStore
 from .openai_voice import OpenAIVoiceClient
 from .realtime_voice import RealtimeConversationSession
 from .scheduled_tasks import ScheduledTask, ScheduledTaskStore
@@ -25,10 +26,12 @@ class VoiceDaemon:
         self.hardware = HatHardware(config.button_gpio, config.led_gpio, config.button_pull_up)
         self.recorder = Recorder(config)
         self.conversation = ConversationStore(config.conversation_file)
+        self.memory = MemoryStore(config)
+        self.memory.ensure_workspace()
         self.scheduled_tasks = ScheduledTaskStore(config)
         self.openai = OpenAIVoiceClient(config) if config.voice_bot_backend == "responses" else None
         self.realtime = (
-            RealtimeConversationSession(config, self.scheduled_tasks)
+            RealtimeConversationSession(config, self.scheduled_tasks, self.memory)
             if config.voice_bot_backend == "realtime"
             else None
         )
@@ -100,16 +103,16 @@ class VoiceDaemon:
         duration = self.realtime.stop_recording()
         LOGGER.info("realtime button released after %.3fs", duration)
 
-        if duration <= self.config.short_click_seconds and self._consume_second_click():
-            LOGGER.info("double click detected; clearing conversation and closing realtime session")
-            self.realtime.clear_pending_input()
-            self.realtime.close()
-            self.conversation.clear()
-            self.hardware.confirm_clear()
-            self._led_mode = "off"
-            return
-
         if duration < self.config.min_record_seconds:
+            if duration <= self.config.short_click_seconds and self._consume_second_click():
+                LOGGER.info("double click detected; clearing conversation and closing realtime session")
+                self.realtime.clear_pending_input()
+                self.realtime.close()
+                self.memory.flush_conversation(self.conversation.load(), "double-click clear")
+                self.conversation.clear()
+                self.hardware.confirm_clear()
+                self._led_mode = "off"
+                return
             LOGGER.info("ignoring short realtime recording: %.3fs", duration)
             self.realtime.clear_pending_input()
             self._set_led_mode("off")
@@ -124,9 +127,11 @@ class VoiceDaemon:
         for result in self.realtime.pop_completed_turns():
             if result.assistant_text:
                 self.conversation.append_pair(result.user_text or "[voice input]", result.assistant_text)
+                self.memory.append_turn(result.user_text or "[voice input]", result.assistant_text)
                 LOGGER.info("realtime turn persisted")
             elif result.requested_close and result.user_text:
                 self.conversation.append_pair(result.user_text, "[realtime session closed]")
+                self.memory.append_turn(result.user_text, "[realtime session closed]")
                 LOGGER.info("realtime close turn persisted")
 
     def _sync_realtime_led(self) -> None:
@@ -212,6 +217,7 @@ class VoiceDaemon:
 
         if duration <= self.config.short_click_seconds and self._consume_second_click():
             LOGGER.info("double click detected; clearing conversation")
+            self.memory.flush_conversation(self.conversation.load(), "double-click clear")
             self.conversation.clear()
             self.hardware.confirm_clear()
             return
@@ -228,8 +234,10 @@ class VoiceDaemon:
                 result = self.realtime.respond_to_audio(history, recording_path)
                 if result.assistant_text:
                     self.conversation.append_pair(result.user_text or "[voice input]", result.assistant_text)
+                    self.memory.append_turn(result.user_text or "[voice input]", result.assistant_text)
                 elif result.requested_close and result.user_text:
                     self.conversation.append_pair(result.user_text, "[realtime session closed]")
+                    self.memory.append_turn(result.user_text, "[realtime session closed]")
                 LOGGER.info("realtime turn complete")
             else:
                 assert self.openai is not None
@@ -237,6 +245,7 @@ class VoiceDaemon:
                 transcript = self.openai.transcribe(recording_path)
                 answer = self.openai.respond_and_speak(history, transcript)
                 self.conversation.append_pair(transcript, answer)
+                self.memory.append_turn(transcript, answer)
                 LOGGER.info("turn complete")
 
     def _consume_second_click(self) -> bool:

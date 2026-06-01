@@ -9,6 +9,12 @@ from voice_ai_bot.realtime_voice import (
     CLOSE_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
+    MEMORY_ADD_TOOL_NAME,
+    MEMORY_FORGET_TOOL_NAME,
+    MEMORY_GET_SOURCE_TOOL_NAME,
+    MEMORY_LIST_TOOL_NAME,
+    MEMORY_SEARCH_TOOL_NAME,
+    MEMORY_UPDATE_TOOL_NAME,
     BackgroundTask,
     START_TASK_TOOL_NAME,
     RealtimeConversationSession,
@@ -126,6 +132,12 @@ def test_realtime_tools_use_async_background_task_interface():
     assert ADD_SCHEDULED_TASK_TOOL_NAME in tool_names
     assert LIST_SCHEDULED_TASKS_TOOL_NAME in tool_names
     assert DELETE_SCHEDULED_TASK_TOOL_NAME in tool_names
+    assert MEMORY_SEARCH_TOOL_NAME in tool_names
+    assert MEMORY_LIST_TOOL_NAME in tool_names
+    assert MEMORY_ADD_TOOL_NAME in tool_names
+    assert MEMORY_UPDATE_TOOL_NAME in tool_names
+    assert MEMORY_FORGET_TOOL_NAME in tool_names
+    assert MEMORY_GET_SOURCE_TOOL_NAME in tool_names
     assert "web_search" not in tool_names
 
 
@@ -152,6 +164,67 @@ def test_silent_cooldown_cancels_pending_response(tmp_path):
 
     assert not session._response_pending
     assert ws.sent[0]["type"] == "response.cancel"
+
+
+def test_response_created_is_ignored_until_response_create_was_sent(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    with session._state_lock:
+        session._response_pending = True
+        session._waiting_for_input_transcript = True
+
+    session._handle_event({"type": "response.created", "response": {"id": "old_response"}})
+
+    assert not session._response_active
+    assert session._response_pending
+    assert session._active_response_id == ""
+
+    with session._state_lock:
+        session._waiting_for_input_transcript = False
+        session._response_create_pending = True
+
+    session._handle_event({"type": "response.created", "response": {"id": "new_response"}})
+
+    assert session._response_active
+    assert not session._response_pending
+    assert session._active_response_id == "new_response"
+
+
+def test_stale_response_events_do_not_pollute_barge_in_turn(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    with session._state_lock:
+        session._recorder = object()
+        session._response_active = True
+        session._active_response_id = "old_response"
+
+    session._handle_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "old_response",
+            "delta": "old speech",
+        }
+    )
+
+    assert session._output_transcript_parts == []
+
+    with session._state_lock:
+        session._recorder = None
+        session._response_active = False
+        session._response_pending = True
+        session._active_response_id = ""
+
+    session._handle_event(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "old_response",
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "stale"}]}],
+            },
+        }
+    )
+
+    assert session.pop_completed_turns() == []
+    assert session._response_pending
 
 
 def test_running_background_task_does_not_count_as_live_response(tmp_path):
@@ -211,6 +284,49 @@ def test_start_task_tool_passes_wakeup_mode(tmp_path):
     assert calls == [("research this", "Research", False)]
 
 
+def test_memory_tools_update_store(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+
+    added = session._execute_realtime_tool_call(
+        {
+            "name": MEMORY_ADD_TOOL_NAME,
+            "arguments": json.dumps({"text": "User likes terse responses.", "kind": "preference"}),
+        }
+    )
+    entry_id = added["entry"]["id"]
+
+    assert added["ok"]
+    assert session._execute_realtime_tool_call(
+        {"name": MEMORY_SEARCH_TOOL_NAME, "arguments": json.dumps({"query": "terse"})}
+    )["results"][0]["entry_id"] == entry_id
+    assert session._execute_realtime_tool_call(
+        {
+            "name": MEMORY_UPDATE_TOOL_NAME,
+            "arguments": json.dumps({"entry_id": entry_id, "text": "User likes detailed responses."}),
+        }
+    )["ok"]
+    assert session._execute_realtime_tool_call(
+        {"name": MEMORY_FORGET_TOOL_NAME, "arguments": json.dumps({"entry_id": entry_id})}
+    )["ok"]
+    assert session._execute_realtime_tool_call(
+        {"name": MEMORY_LIST_TOOL_NAME, "arguments": "{}"}
+    )["entries"] == []
+
+
+def test_memory_tool_arguments_are_tolerant(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    session.memory.append_turn("alpha beta", "gamma")
+
+    output = session._execute_realtime_tool_call(
+        {
+            "name": MEMORY_SEARCH_TOOL_NAME,
+            "arguments": json.dumps({"query": 123, "max_results": "not-an-int"}),
+        }
+    )
+
+    assert output["ok"]
+
+
 def _config(tmp_path):
     return Config(
         openai_api_key="sk-test",
@@ -225,7 +341,7 @@ def _config(tmp_path):
         tts_voice="cedar",
         tts_instructions="test",
         realtime_model="gpt-realtime-2",
-        realtime_reasoning_effort="low",
+        realtime_reasoning_effort="medium",
         realtime_voice="marin",
         realtime_input_rate=24000,
         realtime_input_transcription_model="gpt-4o-transcribe",
@@ -240,11 +356,11 @@ def _config(tmp_path):
         user_country="GB",
         user_timezone="Europe/London",
         web_search_model="gpt-5.5",
-        web_search_reasoning_effort="medium",
+        web_search_reasoning_effort="high",
         web_search_context_size="medium",
         web_search_timeout_seconds=1.0,
         task_model="gpt-5.5",
-        task_reasoning_effort="medium",
+        task_reasoning_effort="high",
         task_reasoning_summary="auto",
         task_timeout_seconds=1.0,
         task_code_execution=True,
@@ -268,4 +384,5 @@ def _config(tmp_path):
         recordings_dir=tmp_path / "recordings",
         tts_chunk_chars=240,
         log_level="INFO",
+        memory_dir=tmp_path / "agent",
     )
