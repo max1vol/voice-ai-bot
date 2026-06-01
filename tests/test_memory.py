@@ -47,6 +47,48 @@ def test_daily_notes_are_searchable_and_conversation_flushes(tmp_path):
     assert flush_results
 
 
+def test_turn_notes_are_queued_for_consolidation(tmp_path):
+    store = MemoryStore(_config(tmp_path))
+
+    store.append_turn("remember that I prefer Russian replies", "I will remember that.")
+
+    pending = store.pending_consolidation_notes(max_notes=10, max_chars=4000)
+    assert len(pending) == 1
+    assert pending[0]["type"] == "turn"
+    assert "Russian replies" in pending[0]["text"]
+
+    store.mark_consolidation_processed(
+        [pending[0]["id"]],
+        summary="saved preference",
+        operation_results=[{"result": {"ok": True}}],
+    )
+    assert store.pending_consolidation_notes(max_notes=10, max_chars=4000) == []
+
+
+def test_consolidation_operations_are_applied_as_app_owned_writes(tmp_path):
+    store = MemoryStore(_config(tmp_path))
+
+    results = store.apply_consolidation_operations(
+        [
+            {
+                "action": "add",
+                "kind": "preference",
+                "text": "User prefers direct answers.",
+            },
+            {
+                "action": "ignore",
+                "reason": "transient chit-chat",
+            },
+        ]
+    )
+
+    assert results[0]["result"]["ok"]
+    assert results[1]["result"]["ignored"]
+    entries = store.list_entries()["entries"]
+    assert entries[0]["text"] == "User prefers direct answers."
+    assert entries[0]["source"] == "gpt-5-5"
+
+
 def test_bootstrap_context_contains_max_code_identity(tmp_path):
     store = MemoryStore(_config(tmp_path))
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,16 +49,21 @@ class MemoryStore:
         self.daily_dir = self.root / "memory"
         self.memory_file = self.root / "MEMORY.md"
         self.tombstones_file = self.root / "memory" / ".tombstones.json"
+        self.consolidation_file = self.root / "memory" / ".consolidation.json"
+        self._lock = threading.RLock()
 
     def ensure_workspace(self) -> None:
-        self.daily_dir.mkdir(parents=True, exist_ok=True)
-        self._write_if_missing("IDENTITY.md", self._default_identity())
-        self._write_if_missing("SOUL.md", self._default_soul())
-        self._write_if_missing("USER.md", self._default_user())
-        self._write_if_missing("AGENTS.md", self._default_agents())
-        self._write_if_missing("MEMORY.md", self._default_memory())
-        if not self.tombstones_file.exists():
-            self._atomic_write_json(self.tombstones_file, {"version": 1, "tombstones": []})
+        with self._lock:
+            self.daily_dir.mkdir(parents=True, exist_ok=True)
+            self._write_if_missing("IDENTITY.md", self._default_identity())
+            self._write_if_missing("SOUL.md", self._default_soul())
+            self._write_if_missing("USER.md", self._default_user())
+            self._write_if_missing("AGENTS.md", self._default_agents())
+            self._write_if_missing("MEMORY.md", self._default_memory())
+            if not self.tombstones_file.exists():
+                self._atomic_write_json(self.tombstones_file, {"version": 1, "tombstones": []})
+            if not self.consolidation_file.exists():
+                self._atomic_write_json(self.consolidation_file, _default_consolidation_state())
 
     def bootstrap_context(self, max_chars: int | None = None) -> str:
         self.ensure_workspace()
@@ -113,112 +119,116 @@ class MemoryStore:
         }
 
     def add_entry(self, text: str, kind: str = "note", source: str = "user") -> dict[str, Any]:
-        self.ensure_workspace()
-        clean = _normalize_text(text)
-        if not clean:
-            return {"ok": False, "error": "text is required"}
-        now = _utc_now()
-        entry = MemoryEntry(
-            id=f"mem_{datetime.now(timezone.utc):%Y%m%d%H%M%S}_{uuid.uuid4().hex[:6]}",
-            text=clean,
-            kind=_safe_token(kind, "note"),
-            source=_safe_token(source, "user"),
-            status="active",
-            created_at=now,
-            updated_at=now,
-            text_hash=_hash_text(clean),
-            start_line=0,
-            end_line=0,
-        )
-        entries = self._load_entries()
-        entries.append(entry)
-        self._write_entries(entries)
-        self.append_note(f"Memory added ({entry.id}): {clean}")
-        return {"ok": True, "entry": self._entry_json(entry)}
-
-    def update_entry(self, entry_id: str, text: str) -> dict[str, Any]:
-        self.ensure_workspace()
-        entry_id = entry_id.strip()
-        clean = _normalize_text(text)
-        if not entry_id:
-            return {"ok": False, "error": "entry_id is required"}
-        if not clean:
-            return {"ok": False, "error": "text is required"}
-        entries = self._load_entries()
-        now = _utc_now()
-        updated: list[MemoryEntry] = []
-        changed: MemoryEntry | None = None
-        for entry in entries:
-            if entry.id != entry_id:
-                updated.append(entry)
-                continue
-            changed = MemoryEntry(
-                id=entry.id,
+        with self._lock:
+            self.ensure_workspace()
+            clean = _normalize_text(text)
+            if not clean:
+                return {"ok": False, "error": "text is required"}
+            now = _utc_now()
+            entry = MemoryEntry(
+                id=f"mem_{datetime.now(timezone.utc):%Y%m%d%H%M%S}_{uuid.uuid4().hex[:6]}",
                 text=clean,
-                kind=entry.kind,
-                source=entry.source,
+                kind=_safe_token(kind, "note"),
+                source=_safe_token(source, "user"),
                 status="active",
-                created_at=entry.created_at,
+                created_at=now,
                 updated_at=now,
                 text_hash=_hash_text(clean),
                 start_line=0,
                 end_line=0,
             )
-            updated.append(changed)
-        if changed is None:
-            return {"ok": False, "error": f"unknown memory entry id: {entry_id}"}
-        self._write_entries(updated)
-        self.append_note(f"Memory updated ({entry_id}): {clean}")
-        return {"ok": True, "entry": self._entry_json(changed)}
+            entries = self._load_entries()
+            entries.append(entry)
+            self._write_entries(entries)
+            self.append_note(f"Memory added ({entry.id}): {clean}", note_type="memory_change")
+            return {"ok": True, "entry": self._entry_json(entry)}
+
+    def update_entry(self, entry_id: str, text: str) -> dict[str, Any]:
+        with self._lock:
+            self.ensure_workspace()
+            entry_id = entry_id.strip()
+            clean = _normalize_text(text)
+            if not entry_id:
+                return {"ok": False, "error": "entry_id is required"}
+            if not clean:
+                return {"ok": False, "error": "text is required"}
+            entries = self._load_entries()
+            now = _utc_now()
+            updated: list[MemoryEntry] = []
+            changed: MemoryEntry | None = None
+            for entry in entries:
+                if entry.id != entry_id:
+                    updated.append(entry)
+                    continue
+                changed = MemoryEntry(
+                    id=entry.id,
+                    text=clean,
+                    kind=entry.kind,
+                    source=entry.source,
+                    status="active",
+                    created_at=entry.created_at,
+                    updated_at=now,
+                    text_hash=_hash_text(clean),
+                    start_line=0,
+                    end_line=0,
+                )
+                updated.append(changed)
+            if changed is None:
+                return {"ok": False, "error": f"unknown memory entry id: {entry_id}"}
+            self._write_entries(updated)
+            self.append_note(f"Memory updated ({entry_id}): {clean}", note_type="memory_change")
+            return {"ok": True, "entry": self._entry_json(changed)}
 
     def forget_entry(self, entry_id: str = "", query: str = "", reason: str = "") -> dict[str, Any]:
-        self.ensure_workspace()
-        entry_id = entry_id.strip()
-        query = query.strip()
-        if not entry_id and not query:
-            return {"ok": False, "error": "entry_id or query is required"}
-        entries = self._load_entries()
-        forgotten: list[MemoryEntry] = []
-        forgotten_originals: list[MemoryEntry] = []
-        kept: list[MemoryEntry] = []
-        query_tokens = set(_tokens(query))
-        now = _utc_now()
-        for entry in entries:
-            should_forget = entry.status == "active" and (
-                (entry_id and entry.id == entry_id)
-                or (query_tokens and query_tokens.issubset(set(_tokens(entry.text))))
+        with self._lock:
+            self.ensure_workspace()
+            entry_id = entry_id.strip()
+            query = query.strip()
+            if not entry_id and not query:
+                return {"ok": False, "error": "entry_id or query is required"}
+            entries = self._load_entries()
+            forgotten: list[MemoryEntry] = []
+            forgotten_originals: list[MemoryEntry] = []
+            kept: list[MemoryEntry] = []
+            query_tokens = set(_tokens(query))
+            now = _utc_now()
+            for entry in entries:
+                should_forget = entry.status == "active" and (
+                    (entry_id and entry.id == entry_id)
+                    or (query_tokens and query_tokens.issubset(set(_tokens(entry.text))))
+                )
+                if not should_forget:
+                    kept.append(entry)
+                    continue
+                forgotten_entry = MemoryEntry(
+                    id=entry.id,
+                    text="[forgotten]",
+                    kind=entry.kind,
+                    source=entry.source,
+                    status="forgotten",
+                    created_at=entry.created_at,
+                    updated_at=now,
+                    text_hash=entry.text_hash,
+                    start_line=0,
+                    end_line=0,
+                )
+                forgotten.append(forgotten_entry)
+                forgotten_originals.append(entry)
+                kept.append(forgotten_entry)
+            if not forgotten:
+                return {"ok": False, "error": "no matching active memory entry found"}
+            self._write_entries(kept)
+            self._append_tombstones(forgotten_originals, reason)
+            self.append_note(
+                "Memory forgotten: "
+                + ", ".join(entry.id for entry in forgotten)
+                + (f" ({reason.strip()})" if reason.strip() else ""),
+                note_type="memory_change",
             )
-            if not should_forget:
-                kept.append(entry)
-                continue
-            forgotten_entry = MemoryEntry(
-                id=entry.id,
-                text="[forgotten]",
-                kind=entry.kind,
-                source=entry.source,
-                status="forgotten",
-                created_at=entry.created_at,
-                updated_at=now,
-                text_hash=entry.text_hash,
-                start_line=0,
-                end_line=0,
-            )
-            forgotten.append(forgotten_entry)
-            forgotten_originals.append(entry)
-            kept.append(forgotten_entry)
-        if not forgotten:
-            return {"ok": False, "error": "no matching active memory entry found"}
-        self._write_entries(kept)
-        self._append_tombstones(forgotten_originals, reason)
-        self.append_note(
-            "Memory forgotten: "
-            + ", ".join(entry.id for entry in forgotten)
-            + (f" ({reason.strip()})" if reason.strip() else "")
-        )
-        return {
-            "ok": True,
-            "forgotten": [self._entry_json(entry) for entry in forgotten],
-        }
+            return {
+                "ok": True,
+                "forgotten": [self._entry_json(entry) for entry in forgotten],
+            }
 
     def search(self, query: str, max_results: int = 5) -> dict[str, Any]:
         self.ensure_workspace()
@@ -270,7 +280,9 @@ class MemoryStore:
         self.append_note(
             "Turn\n"
             f"User: {_normalize_text(user_text) or '[empty]'}\n"
-            f"Assistant: {_normalize_text(assistant_text) or '[empty]'}"
+            f"Assistant: {_normalize_text(assistant_text) or '[empty]'}",
+            note_type="turn",
+            queue_for_consolidation=True,
         )
 
     def flush_conversation(self, messages: Iterable[Message], reason: str) -> None:
@@ -280,24 +292,162 @@ class MemoryStore:
         lines = [f"Conversation flush before {reason}"]
         for message in items[-24:]:
             lines.append(f"{message.role.title()}: {_normalize_text(message.content)}")
-        self.append_note("\n".join(lines))
+        self.append_note(
+            "\n".join(lines),
+            note_type="conversation_flush",
+            queue_for_consolidation=True,
+        )
 
-    def append_note(self, text: str) -> None:
-        self.ensure_workspace()
-        clean = text.strip()
-        if not clean:
-            return
-        now = self._local_now()
-        path = self.daily_dir / f"{now:%Y-%m-%d}.md"
-        header = ""
-        if not path.exists():
-            header = f"# {now:%Y-%m-%d}\n\n"
-        with path.open("a", encoding="utf-8") as fh:
-            if header:
-                fh.write(header)
-            fh.write(f"## {now:%H:%M:%S} {now.tzname() or self.config.user_timezone}\n\n")
-            fh.write(clean)
-            fh.write("\n\n")
+    def append_note(
+        self,
+        text: str,
+        note_type: str = "note",
+        queue_for_consolidation: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self.ensure_workspace()
+            clean = text.strip()
+            if not clean:
+                return None
+            now = self._local_now()
+            created_at = now.isoformat()
+            note_id = f"note_{datetime.now(timezone.utc):%Y%m%d%H%M%S}_{uuid.uuid4().hex[:6]}"
+            safe_type = _safe_token(note_type, "note")
+            path = self.daily_dir / f"{now:%Y-%m-%d}.md"
+            rel_path = path.relative_to(self.root).as_posix()
+            header = ""
+            if not path.exists():
+                header = f"# {now:%Y-%m-%d}\n\n"
+            with path.open("a", encoding="utf-8") as fh:
+                if header:
+                    fh.write(header)
+                fh.write(
+                    f'<!-- voice-ai-bot:note id="{note_id}" type="{safe_type}" '
+                    f'created_at="{created_at}" -->\n'
+                )
+                fh.write(f"## {now:%H:%M:%S} {now.tzname() or self.config.user_timezone}\n\n")
+                fh.write(clean)
+                fh.write("\n<!-- voice-ai-bot:note:end -->\n\n")
+            note = {
+                "id": note_id,
+                "type": safe_type,
+                "path": rel_path,
+                "created_at": created_at,
+                "text": clean,
+            }
+            if queue_for_consolidation:
+                self._enqueue_consolidation_note(note)
+            return note
+
+    def pending_consolidation_notes(
+        self,
+        max_notes: int,
+        max_chars: int,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            self.ensure_workspace()
+            state = self._load_consolidation_state()
+            pending = [item for item in state.get("pending", []) if isinstance(item, dict)]
+            selected: list[dict[str, Any]] = []
+            used_chars = 0
+            for item in pending:
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                candidate_chars = len(text)
+                if selected and used_chars + candidate_chars > max_chars:
+                    break
+                selected.append(
+                    {
+                        "id": str(item.get("id") or ""),
+                        "type": str(item.get("type") or "note"),
+                        "path": str(item.get("path") or ""),
+                        "created_at": str(item.get("created_at") or ""),
+                        "text": text,
+                        "attempts": int(item.get("attempts") or 0),
+                    }
+                )
+                used_chars += candidate_chars
+                if len(selected) >= max(1, max_notes):
+                    break
+            return selected
+
+    def mark_consolidation_processed(
+        self,
+        note_ids: Iterable[str],
+        summary: str,
+        operation_results: list[dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            self.ensure_workspace()
+            ids = {note_id for note_id in note_ids if note_id}
+            if not ids:
+                return
+            state = self._load_consolidation_state()
+            pending = [item for item in state.get("pending", []) if item.get("id") not in ids]
+            processed = [item for item in state.get("processed", []) if isinstance(item, dict)]
+            now = _utc_now()
+            for note_id in sorted(ids):
+                processed.append({"id": note_id, "processed_at": now})
+            state["pending"] = pending
+            state["processed"] = processed[-1000:]
+            runs = [item for item in state.get("runs", []) if isinstance(item, dict)]
+            runs.append(
+                {
+                    "completed_at": now,
+                    "note_ids": sorted(ids),
+                    "summary": _normalize_text(summary)[:1000],
+                    "operation_count": len(operation_results),
+                }
+            )
+            state["runs"] = runs[-100:]
+            self._atomic_write_json(self.consolidation_file, state)
+
+    def mark_consolidation_failed(self, note_ids: Iterable[str], error: str) -> None:
+        with self._lock:
+            self.ensure_workspace()
+            ids = {note_id for note_id in note_ids if note_id}
+            if not ids:
+                return
+            state = self._load_consolidation_state()
+            now = _utc_now()
+            for item in state.get("pending", []):
+                if isinstance(item, dict) and item.get("id") in ids:
+                    item["attempts"] = int(item.get("attempts") or 0) + 1
+                    item["last_error"] = _normalize_text(error)[:1000]
+                    item["last_attempt_at"] = now
+            self._atomic_write_json(self.consolidation_file, state)
+
+    def apply_consolidation_operations(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                results.append({"ok": False, "error": "operation is not an object"})
+                continue
+            action = str(operation.get("action") or "").strip().lower()
+            if action == "add":
+                result = self.add_entry(
+                    text=str(operation.get("text") or ""),
+                    kind=str(operation.get("kind") or "note"),
+                    source="gpt-5.5",
+                )
+            elif action == "update":
+                result = self.update_entry(
+                    entry_id=str(operation.get("entry_id") or ""),
+                    text=str(operation.get("text") or ""),
+                )
+            elif action == "forget":
+                result = self.forget_entry(
+                    entry_id=str(operation.get("entry_id") or ""),
+                    query=str(operation.get("query") or ""),
+                    reason=str(operation.get("reason") or "GPT-5.5 memory consolidation"),
+                )
+            elif action in {"ignore", "noop", "none"}:
+                result = {"ok": True, "ignored": True, "reason": str(operation.get("reason") or "")}
+            else:
+                result = {"ok": False, "error": f"unknown consolidation action: {action}"}
+            results.append({"operation": operation, "result": result})
+        return results
 
     def _search_candidates(self) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
@@ -371,6 +521,8 @@ class MemoryStore:
 
         for index, line in enumerate(lines, start=1):
             stripped = line.strip()
+            if stripped.startswith("<!-- voice-ai-bot:note"):
+                continue
             if stripped.startswith("#") or not stripped:
                 flush(index - 1)
                 start_line = index + 1
@@ -453,6 +605,29 @@ class MemoryStore:
                 }
             )
         self._atomic_write_json(self.tombstones_file, payload)
+
+    def _load_consolidation_state(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.consolidation_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            payload = _default_consolidation_state()
+        if not isinstance(payload, dict):
+            payload = _default_consolidation_state()
+        payload.setdefault("version", 1)
+        payload.setdefault("pending", [])
+        payload.setdefault("processed", [])
+        payload.setdefault("runs", [])
+        return payload
+
+    def _enqueue_consolidation_note(self, note: dict[str, Any]) -> None:
+        state = self._load_consolidation_state()
+        note_id = note.get("id")
+        pending = [item for item in state.get("pending", []) if isinstance(item, dict)]
+        if any(item.get("id") == note_id for item in pending):
+            return
+        pending.append({**note, "attempts": 0})
+        state["pending"] = pending[-500:]
+        self._atomic_write_json(self.consolidation_file, state)
 
     def _entry_json(self, entry: MemoryEntry) -> dict[str, Any]:
         return {
@@ -553,6 +728,15 @@ def _render_entry(entry: MemoryEntry) -> str:
     body_lines = entry.text.splitlines() or [""]
     body = "\n".join(("- " + body_lines[0], *("  " + line for line in body_lines[1:])))
     return f"<!-- voice-ai-bot:memory {meta} -->\n{body}"
+
+
+def _default_consolidation_state() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "pending": [],
+        "processed": [],
+        "runs": [],
+    }
 
 
 def _parse_entry_body(body: str) -> str:

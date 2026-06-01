@@ -11,7 +11,7 @@ Behavior:
 - In realtime mode, pressing the button while the speaker is talking cancels playback and starts the next turn.
 - Double-click the button to clear the saved conversation.
 - Conversation history is persisted as JSON on the Pi.
-- Max Code has a file-backed memory workspace under `/var/lib/voice-ai-bot/agent`, with durable memory tools for searching, adding, correcting, and forgetting saved facts.
+- Max Code has a file-backed memory workspace under `/var/lib/voice-ai-bot/agent`. Raw turn notes are written immediately as an audit log, and GPT-5.5 asynchronously consolidates them into compact durable memory entries.
 - Realtime turns include the current local time and user context for Cambridge, UK.
 - The realtime model has background task tools backed by GPT-5.5 with hosted web search, reasoning summaries, and hosted code interpreter for current facts, calculations, code generation, and code checks.
 - Background tasks can wake the realtime model when they finish so the device can speak the result, but unsolicited wakeups obey the same quiet-hours limit.
@@ -22,6 +22,11 @@ Two backends are available:
 
 - `VOICE_BOT_BACKEND=responses`: the original flow, using speech-to-text, GPT-5.5, and TTS.
 - `VOICE_BOT_BACKEND=realtime`: a persistent push-to-talk WebSocket session using `gpt-realtime-2`. It disables VAD, streams PCM from the mic while the button is held, streams PCM audio back to the speaker, supports button barge-in, can start/list/inspect/cancel background GPT-5.5 tasks, can manage memory and scheduled reminders/alarms, and closes on idle timeout, hard session timeout, double-click, or when the model calls `close_realtime_session`.
+
+Memory works in two layers:
+
+- `memory/YYYY-MM-DD.md` receives raw user/assistant turn notes immediately. This does not depend on model judgment, so it is crash-safe.
+- `MEMORY.md` contains compact durable entries. The realtime model can still use explicit memory tools, but normal curation is handled by an asynchronous GPT-5.5 consolidation worker with high reasoning. The worker reads queued raw notes, proposes JSON add/update/forget/ignore operations, and application code applies those operations.
 
 ## Hardware Defaults
 
@@ -73,6 +78,13 @@ SCHEDULE_QUIET_END=07:30
 MEMORY_DIR=/var/lib/voice-ai-bot/agent
 MEMORY_BOOTSTRAP_CHARS=12000
 MEMORY_ACTIVE_CONTEXT_CHARS=1800
+MEMORY_CONSOLIDATION_ENABLED=true
+MEMORY_CONSOLIDATION_MODEL=gpt-5.5
+MEMORY_CONSOLIDATION_REASONING_EFFORT=high
+MEMORY_CONSOLIDATION_DEBOUNCE_SECONDS=5
+MEMORY_CONSOLIDATION_SHUTDOWN_TIMEOUT_SECONDS=30
+MEMORY_CONSOLIDATION_MAX_NOTES=12
+MEMORY_CONSOLIDATION_MAX_CHARS=16000
 ```
 
 The service intentionally keeps secrets out of git. `.env` is copied to the Pi during install but is ignored locally and remotely.

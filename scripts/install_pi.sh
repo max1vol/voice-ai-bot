@@ -19,6 +19,9 @@ ssh "$target" 'sudo install -d -o pi -g pi /opt/voice-ai-bot /var/lib/voice-ai-b
 rsync -az --delete \
   --exclude .git \
   --exclude .venv \
+  --exclude build \
+  --exclude dist \
+  --exclude '*.egg-info' \
   --exclude __pycache__ \
   --exclude .pytest_cache \
   "$repo_dir/" "$target:/opt/voice-ai-bot/"

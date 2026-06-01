@@ -100,6 +100,13 @@ class Config:
     memory_dir: Path = Path("/var/lib/voice-ai-bot/agent")
     memory_bootstrap_chars: int = 12000
     memory_active_context_chars: int = 1800
+    memory_consolidation_enabled: bool = True
+    memory_consolidation_model: str = "gpt-5.5"
+    memory_consolidation_reasoning_effort: str = "high"
+    memory_consolidation_debounce_seconds: float = 5.0
+    memory_consolidation_shutdown_timeout_seconds: float = 30.0
+    memory_consolidation_max_notes: int = 12
+    memory_consolidation_max_chars: int = 16000
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -178,4 +185,20 @@ class Config:
             memory_dir=Path(os.getenv("MEMORY_DIR", "/var/lib/voice-ai-bot/agent")),
             memory_bootstrap_chars=_int_env("MEMORY_BOOTSTRAP_CHARS", 12000),
             memory_active_context_chars=_int_env("MEMORY_ACTIVE_CONTEXT_CHARS", 1800),
+            memory_consolidation_enabled=_bool_env("MEMORY_CONSOLIDATION_ENABLED", True),
+            memory_consolidation_model=os.getenv(
+                "MEMORY_CONSOLIDATION_MODEL",
+                os.getenv("TASK_MODEL", "gpt-5.5"),
+            ),
+            memory_consolidation_reasoning_effort=os.getenv(
+                "MEMORY_CONSOLIDATION_REASONING_EFFORT",
+                os.getenv("TASK_REASONING_EFFORT", "high"),
+            ),
+            memory_consolidation_debounce_seconds=_float_env("MEMORY_CONSOLIDATION_DEBOUNCE_SECONDS", 5.0),
+            memory_consolidation_shutdown_timeout_seconds=_float_env(
+                "MEMORY_CONSOLIDATION_SHUTDOWN_TIMEOUT_SECONDS",
+                30.0,
+            ),
+            memory_consolidation_max_notes=_int_env("MEMORY_CONSOLIDATION_MAX_NOTES", 12),
+            memory_consolidation_max_chars=_int_env("MEMORY_CONSOLIDATION_MAX_CHARS", 16000),
         )
