@@ -60,6 +60,9 @@ class RealtimeTurnResult:
 class BackgroundTask:
     id: str
     query: str
+    title: str = ""
+    wakeup_on_complete: bool = False
+    wakeup_reported: bool = False
     status: str = "queued"
     progress: str = "queued"
     response_id: str = ""
@@ -96,8 +99,10 @@ def realtime_session_instructions(config: Config) -> str:
         "price, schedule, or otherwise time-sensitive facts. Prefer the background task tools for web, code, "
         "calculation, or multi-step research so the voice session stays interruptible. "
         "When start_background_task returns a running task, briefly tell the user it started instead of polling "
-        "repeatedly in the same response. Use list_background_tasks or get_background_task when the user asks "
-        "what is running, asks for progress, or asks for results. "
+        "repeatedly in the same response. Set wakeup_on_complete true when the user expects the final answer "
+        "to be spoken automatically after the task finishes; set it false for tasks the user only wants to check later. "
+        "Use list_background_tasks or get_background_task when the user asks what is running, asks for progress, "
+        "or asks for results. "
         "The user can ask you to create, list, or remove scheduled reminders, alarms, and other timed tasks. "
         "Use the scheduled-task tools for that. Spoken scheduled tasks must not start during quiet hours "
         f"{config.schedule_quiet_start}-{config.schedule_quiet_end} local time; if the requested time falls there, "
@@ -152,6 +157,13 @@ def realtime_tools() -> list[dict[str, Any]]:
                     "title": {
                         "type": "string",
                         "description": "Optional short human-readable title for the task.",
+                    },
+                    "wakeup_on_complete": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true when the device should speak the final result automatically after the task "
+                            "finishes. Set false for silent tasks the user will ask about later."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -285,14 +297,20 @@ class BackgroundTaskManager:
         self._tasks: dict[str, BackgroundTask] = {}
         self._lock = threading.RLock()
 
-    def start(self, query: str, title: str = "") -> dict[str, Any]:
+    def start(self, query: str, title: str = "", wakeup_on_complete: bool = False) -> dict[str, Any]:
         query = query.strip()
         if not query:
             return {"ok": False, "error": "query is required"}
         task_id = f"task_{uuid.uuid4().hex[:10]}"
-        task = BackgroundTask(id=task_id, query=query)
-        if title.strip():
-            task.progress = f"queued: {title.strip()}"
+        clean_title = title.strip()
+        task = BackgroundTask(
+            id=task_id,
+            query=query,
+            title=clean_title,
+            wakeup_on_complete=wakeup_on_complete,
+        )
+        if clean_title:
+            task.progress = f"queued: {clean_title}"
         with self._lock:
             self._prune_locked()
             if len(self._tasks) >= self.config.max_background_tasks:
@@ -300,7 +318,7 @@ class BackgroundTaskManager:
             self._tasks[task_id] = task
         thread = threading.Thread(target=self._run_task, args=(task_id,), name=f"task-{task_id}", daemon=True)
         thread.start()
-        LOGGER.info("started background task %s: %s", task_id, query)
+        LOGGER.info("started background task %s wakeup=%s: %s", task_id, wakeup_on_complete, query)
         return {"ok": True, "task": self._snapshot(task, include_result=False)}
 
     def list(self, include_completed: bool = False) -> dict[str, Any]:
@@ -339,6 +357,25 @@ class BackgroundTaskManager:
     def has_running(self) -> bool:
         with self._lock:
             return any(task.status in {"queued", "running", "cancelling"} for task in self._tasks.values())
+
+    def pending_wakeups(self, limit: int = 1) -> list[dict[str, Any]]:
+        with self._lock:
+            tasks = [
+                task
+                for task in self._tasks.values()
+                if task.wakeup_on_complete
+                and not task.wakeup_reported
+                and task.status in {"completed", "failed"}
+            ]
+            tasks.sort(key=lambda task: task.completed_at or task.updated_at)
+            return [self._snapshot(task, include_result=True) for task in tasks[:limit]]
+
+    def mark_wakeup_reported(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.wakeup_reported = True
+                task.updated_at = time.time()
 
     def _run_task(self, task_id: str) -> None:
         with self._lock:
@@ -510,7 +547,10 @@ class BackgroundTaskManager:
     def _snapshot(self, task: BackgroundTask, include_result: bool) -> dict[str, Any]:
         return {
             "id": task.id,
+            "title": task.title,
             "query": task.query,
+            "wakeup_on_complete": task.wakeup_on_complete,
+            "wakeup_reported": task.wakeup_reported,
             "status": task.status,
             "progress": task.progress,
             "created_at": _iso_time(task.created_at),
@@ -798,6 +838,7 @@ class RealtimeConversationSession:
 
         self._response_pending = False
         self._response_active = False
+        self._response_wait_started_at = 0.0
         self._tool_active = False
         self._tool_generation = 0
         self._active_response_id = ""
@@ -815,8 +856,7 @@ class RealtimeConversationSession:
             if self._recorder is not None:
                 raise RuntimeError("realtime recording is already active")
             self._last_activity_at = time.monotonic()
-            self._interrupt_response_locked()
-            self._reset_turn_text_locked()
+            self._abort_playback_locked()
             self._recorder = RawPcmRecorder(self.config)
             self._capture_queue = queue.Queue()
             self._capture_bytes = 0
@@ -836,6 +876,9 @@ class RealtimeConversationSession:
         self._capture_thread.start()
 
         try:
+            with self._state_lock:
+                self._interrupt_response_locked()
+                self._reset_turn_text_locked()
             self.ensure_open(history)
             self._send({"type": "input_audio_buffer.clear"})
             self._sender_thread = threading.Thread(
@@ -872,6 +915,7 @@ class RealtimeConversationSession:
         )
         with self._state_lock:
             self._response_pending = True
+            self._response_wait_started_at = time.monotonic()
             self._last_activity_at = time.monotonic()
         LOGGER.info("committed realtime turn: %d PCM bytes", sent_audio_bytes)
 
@@ -936,6 +980,25 @@ class RealtimeConversationSession:
         LOGGER.info("closing realtime session after %.1fs hard max age", age)
         self.close()
 
+    def cool_down_if_silent(self) -> None:
+        cooldown = self.config.realtime_silent_cooldown_seconds
+        if cooldown <= 0:
+            return
+        with self._state_lock:
+            if self._ws is None or self._recorder is not None:
+                return
+            if not (self._response_pending or self._response_active or self._tool_active):
+                return
+            if self._playback is not None or self._output_transcript_parts or self._output_transcript_final:
+                return
+            wait_started_at = self._response_wait_started_at or self._last_activity_at
+            silent_for = time.monotonic() - wait_started_at
+            if silent_for < cooldown:
+                return
+            LOGGER.info("cooling down silent realtime response after %.1fs", silent_for)
+            self._interrupt_response_locked()
+            self._reset_turn_text_locked()
+
     def close(self) -> None:
         receiver_thread: threading.Thread | None
         with self._state_lock:
@@ -946,6 +1009,7 @@ class RealtimeConversationSession:
             self._receiver_thread = None
             self._response_pending = False
             self._response_active = False
+            self._response_wait_started_at = 0.0
             self._tool_active = False
             self._tool_generation += 1
             self._abort_playback_locked()
@@ -1085,14 +1149,18 @@ class RealtimeConversationSession:
                 self._response_pending = False
                 self._response_active = True
                 self._active_response_id = response.get("id", "")
+                if not self._response_wait_started_at:
+                    self._response_wait_started_at = time.monotonic()
             elif event_type in {"response.output_item.created", "response.output_item.added"}:
                 item = event.get("item", {})
                 if item.get("type") == "message":
                     self._output_item_id = item.get("id", "")
                     self._output_audio_bytes = 0
             elif event_type == "response.output_audio.delta":
+                self._response_wait_started_at = 0.0
                 self._write_output_audio_locked(base64.b64decode(event.get("delta", "")))
             elif event_type == "response.output_audio_transcript.delta":
+                self._response_wait_started_at = 0.0
                 self._output_transcript_parts.append(event.get("delta", ""))
             elif event_type == "response.output_audio_transcript.done":
                 self._output_transcript_final = event.get("transcript", "").strip()
@@ -1109,6 +1177,7 @@ class RealtimeConversationSession:
             LOGGER.info("realtime response usage: %s", usage)
         self._response_pending = False
         self._response_active = False
+        self._response_wait_started_at = 0.0
         self._active_response_id = ""
         self._close_playback_locked(check=True)
 
@@ -1121,6 +1190,7 @@ class RealtimeConversationSession:
         async_tool_calls = [call for call in tool_calls if call.get("name") in ASYNC_TASK_TOOL_NAMES]
         if async_tool_calls:
             self._tool_active = True
+            self._response_wait_started_at = time.monotonic()
             self._tool_generation += 1
             generation = self._tool_generation
             threading.Thread(
@@ -1174,6 +1244,7 @@ class RealtimeConversationSession:
                     return
                 self._tool_active = False
                 self._response_pending = True
+                self._response_wait_started_at = time.monotonic()
             self._send(
                 {
                     "type": "response.create",
@@ -1196,7 +1267,8 @@ class RealtimeConversationSession:
         if name in {START_TASK_TOOL_NAME, WEB_SEARCH_TOOL_NAME}:
             query = arguments.get("query", "").strip()
             title = arguments.get("title", "").strip()
-            return self.tasks.start(query, title=title)
+            wakeup_on_complete = parse_bool_argument(arguments.get("wakeup_on_complete"), default=False)
+            return self.tasks.start(query, title=title, wakeup_on_complete=wakeup_on_complete)
         if name == LIST_TASKS_TOOL_NAME:
             return self.tasks.list(include_completed=bool(arguments.get("include_completed", False)))
         if name == GET_TASK_TOOL_NAME:
@@ -1268,12 +1340,75 @@ class RealtimeConversationSession:
         )
         with self._state_lock:
             self._response_pending = True
+            self._response_wait_started_at = time.monotonic()
             self._last_activity_at = time.monotonic()
         LOGGER.info("started scheduled speech: %s", title)
         return True
 
+    def pending_background_wakeups(self, limit: int = 1) -> list[dict[str, Any]]:
+        return self.tasks.pending_wakeups(limit=limit)
+
+    def mark_background_wakeup_reported(self, task_id: str) -> None:
+        self.tasks.mark_wakeup_reported(task_id)
+
+    def trigger_background_task_wakeup(self, history: Iterable[Message], task: dict[str, Any]) -> bool:
+        self._raise_background_error()
+        task_id = str(task.get("id") or "").strip()
+        title = str(task.get("title") or task.get("progress") or task_id or "Background task").strip()
+        if not task_id:
+            return False
+        with self._state_lock:
+            if self._is_busy_locked():
+                return False
+            self._interrupt_response_locked()
+            self._reset_turn_text_locked()
+            self._input_transcript_final = f"[background task completed: {title}]"
+
+        self.ensure_open(history)
+        self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "A background task has finished and was marked to wake the user. "
+                                "Summarize the result aloud now. Task JSON: "
+                                f"{json.dumps(task, ensure_ascii=False)}"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+        self._send(
+            {
+                "type": "response.create",
+                "response": {
+                    "output_modalities": ["audio"],
+                    "instructions": (
+                        f"{local_context(self.config)} "
+                        "A background task finished. Briefly tell the user the result or failure. "
+                        "Do not mention internal tool names unless useful."
+                    ),
+                },
+            }
+        )
+        with self._state_lock:
+            self._response_pending = True
+            self._response_wait_started_at = time.monotonic()
+            self._last_activity_at = time.monotonic()
+        LOGGER.info("started background task wakeup for %s", task_id)
+        return True
+
     def _write_output_audio_locked(self, chunk: bytes) -> None:
         if not chunk:
+            return
+        if self._recorder is not None:
+            self._output_audio_bytes += len(chunk)
             return
         if self._playback is None:
             self._playback = self.player.open_stream(rate=24000, channels=1)
@@ -1283,6 +1418,7 @@ class RealtimeConversationSession:
 
     def _interrupt_response_locked(self) -> None:
         ws_is_open = self._ws is not None
+        self._abort_playback_locked()
         if ws_is_open and (self._response_pending or self._response_active):
             self._send(
                 {
@@ -1290,7 +1426,6 @@ class RealtimeConversationSession:
                     "type": "response.cancel",
                 }
             )
-        self._abort_playback_locked()
         if ws_is_open and self._output_item_id and self._output_audio_bytes:
             audio_end_ms = int(self._output_audio_bytes / 2 / 24000 * 1000)
             self._send(
@@ -1306,6 +1441,7 @@ class RealtimeConversationSession:
             LOGGER.info("skipping audio truncate because realtime session is already closed")
         self._response_pending = False
         self._response_active = False
+        self._response_wait_started_at = 0.0
         self._active_response_id = ""
         self._tool_active = False
         self._tool_generation += 1
@@ -1412,6 +1548,22 @@ def parse_tool_arguments(call: dict[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_bool_argument(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
 
 
 def extract_response_text(response: dict[str, Any]) -> str:

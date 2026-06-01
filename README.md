@@ -13,6 +13,7 @@ Behavior:
 - Conversation history is persisted as JSON on the Pi.
 - Realtime turns include the current local time and user context for Cambridge, UK.
 - The realtime model has background task tools backed by GPT-5.5 with hosted web search, reasoning summaries, and hosted code interpreter for current facts, calculations, and code work.
+- Background tasks can wake the realtime model when they finish so the device can speak the result, but unsolicited wakeups obey the same quiet-hours limit.
 - The realtime model can create, list, and remove scheduled reminders, alarms, and timed tasks. Scheduled speech is persisted as JSON and will not start during quiet hours: 21:00-07:30 local time.
 - Before calling OpenAI, the daemon waits for DNS and TCP connectivity to `api.openai.com`; this avoids losing the first turn while Wi-Fi is still settling after boot.
 
@@ -54,6 +55,7 @@ REALTIME_MODEL=gpt-realtime-2
 REALTIME_REASONING_EFFORT=low
 REALTIME_IDLE_TIMEOUT_SECONDS=45
 REALTIME_MAX_SESSION_SECONDS=300
+REALTIME_SILENT_COOLDOWN_SECONDS=5
 USER_CITY=Cambridge
 USER_REGION=Cambridgeshire
 USER_COUNTRY=GB

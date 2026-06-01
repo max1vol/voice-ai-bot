@@ -4,7 +4,9 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime
 from types import FrameType
+from zoneinfo import ZoneInfo
 
 from .audio_io import Recorder
 from .config import Config
@@ -71,7 +73,9 @@ class VoiceDaemon:
                 self.realtime.check_health()
                 self.realtime.close_if_too_old()
                 self.realtime.close_if_idle()
+                self.realtime.cool_down_if_silent()
                 self._run_due_scheduled_tasks()
+                self._run_due_background_wakeups()
                 self._sync_realtime_led()
                 if not self.hardware.wait_for_press(timeout=0.05):
                     continue
@@ -165,6 +169,26 @@ class VoiceDaemon:
             return True
         LOGGER.warning("unknown scheduled task action %s for %s", task.action, task.id)
         return False
+
+    def _run_due_background_wakeups(self) -> None:
+        if self.realtime is None or self.realtime.is_voice_busy:
+            return
+        if self._quiet_for_unsolicited_speech():
+            return
+        for task in self.realtime.pending_background_wakeups(limit=1):
+            if self.realtime.trigger_background_task_wakeup(self.conversation.load(), task):
+                task_id = str(task.get("id") or "")
+                self.realtime.mark_background_wakeup_reported(task_id)
+                self._set_led_mode("blink")
+                LOGGER.info("started background wakeup for task %s", task_id)
+                return
+
+    def _quiet_for_unsolicited_speech(self) -> bool:
+        try:
+            now = datetime.now(ZoneInfo(self.config.user_timezone))
+        except Exception:
+            now = datetime.now().astimezone()
+        return self.scheduled_tasks.is_quiet_time(now)
 
     def _set_led_mode(self, mode: str) -> None:
         if self._led_mode == mode:

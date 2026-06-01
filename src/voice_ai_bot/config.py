@@ -62,6 +62,7 @@ class Config:
     realtime_response_timeout_seconds: float
     realtime_idle_timeout_seconds: float
     realtime_max_session_seconds: float
+    realtime_silent_cooldown_seconds: float
     realtime_history_messages: int
     realtime_safety_identifier: str
     user_city: str
@@ -132,6 +133,7 @@ class Config:
             realtime_response_timeout_seconds=_float_env("REALTIME_RESPONSE_TIMEOUT_SECONDS", 90.0),
             realtime_idle_timeout_seconds=_float_env("REALTIME_IDLE_TIMEOUT_SECONDS", 45.0),
             realtime_max_session_seconds=_float_env("REALTIME_MAX_SESSION_SECONDS", 120.0),
+            realtime_silent_cooldown_seconds=_float_env("REALTIME_SILENT_COOLDOWN_SECONDS", 5.0),
             realtime_history_messages=_int_env("REALTIME_HISTORY_MESSAGES", 16),
             realtime_safety_identifier=os.getenv("REALTIME_SAFETY_IDENTIFIER", "voice-ai-bot-local"),
             user_city=os.getenv("USER_CITY", "Cambridge"),

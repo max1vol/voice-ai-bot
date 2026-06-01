@@ -1,3 +1,5 @@
+import json
+import time
 import wave
 
 from voice_ai_bot.conversation import Message
@@ -7,6 +9,7 @@ from voice_ai_bot.realtime_voice import (
     CLOSE_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
+    BackgroundTask,
     START_TASK_TOOL_NAME,
     RealtimeConversationSession,
     conversation_item_for_message,
@@ -18,6 +21,14 @@ from voice_ai_bot.realtime_voice import (
     response_function_calls,
     response_requested_close,
 )
+
+
+class FakeWebSocket:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, raw):
+        self.sent.append(json.loads(raw))
 
 
 def test_iter_wav_pcm16_chunks_reads_expected_audio(tmp_path):
@@ -103,9 +114,12 @@ def test_control_errors_can_be_ignored_by_event_id():
 
 
 def test_realtime_tools_use_async_background_task_interface():
-    tool_names = {tool["name"] for tool in realtime_tools()}
+    tools = realtime_tools()
+    tool_names = {tool["name"] for tool in tools}
+    start_task_tool = next(tool for tool in tools if tool["name"] == START_TASK_TOOL_NAME)
 
     assert START_TASK_TOOL_NAME in tool_names
+    assert "wakeup_on_complete" in start_task_tool["parameters"]["properties"]
     assert "list_background_tasks" in tool_names
     assert "get_background_task" in tool_names
     assert "cancel_background_task" in tool_names
@@ -124,6 +138,67 @@ def test_interrupt_skips_truncate_when_session_is_closed(tmp_path):
 
     assert session._output_item_id == ""
     assert session._output_audio_bytes == 0
+
+
+def test_silent_cooldown_cancels_pending_response(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    ws = FakeWebSocket()
+    with session._state_lock:
+        session._ws = ws
+        session._response_pending = True
+        session._response_wait_started_at = time.monotonic() - 10
+
+    session.cool_down_if_silent()
+
+    assert not session._response_pending
+    assert ws.sent[0]["type"] == "response.cancel"
+
+
+def test_background_task_wakeup_queue_marks_reported(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    task = BackgroundTask(
+        id="task_123",
+        query="find something",
+        title="Find something",
+        wakeup_on_complete=True,
+        status="completed",
+        result="done",
+        completed_at=time.time(),
+    )
+    session.tasks._tasks[task.id] = task
+
+    pending = session.pending_background_wakeups()
+
+    assert pending[0]["id"] == "task_123"
+    assert pending[0]["result"] == "done"
+    session.mark_background_wakeup_reported("task_123")
+    assert session.pending_background_wakeups() == []
+
+
+def test_start_task_tool_passes_wakeup_mode(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    calls = []
+
+    def fake_start(query, title="", wakeup_on_complete=True):
+        calls.append((query, title, wakeup_on_complete))
+        return {"ok": True}
+
+    session.tasks.start = fake_start
+    output = session._execute_realtime_tool_call(
+        {
+            "name": START_TASK_TOOL_NAME,
+            "arguments": json.dumps(
+                {
+                    "query": "research this",
+                    "title": "Research",
+                    "wakeup_on_complete": False,
+                }
+            ),
+        }
+    )
+
+    assert output == {"ok": True}
+    assert calls == [("research this", "Research", False)]
 
 
 def _config(tmp_path):
@@ -147,6 +222,7 @@ def _config(tmp_path):
         realtime_response_timeout_seconds=1.0,
         realtime_idle_timeout_seconds=1.0,
         realtime_max_session_seconds=1.0,
+        realtime_silent_cooldown_seconds=5.0,
         realtime_history_messages=4,
         realtime_safety_identifier="test",
         user_city="Cambridge",

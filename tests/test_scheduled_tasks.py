@@ -137,6 +137,7 @@ def _config(tmp_path: Path) -> Config:
         realtime_response_timeout_seconds=1.0,
         realtime_idle_timeout_seconds=1.0,
         realtime_max_session_seconds=1.0,
+        realtime_silent_cooldown_seconds=5.0,
         realtime_history_messages=4,
         realtime_safety_identifier="test",
         user_city="Cambridge",
