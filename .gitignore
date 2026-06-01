@@ -16,4 +16,5 @@ build/
 *.wav
 *.pcm
 conversation.json
+scheduled_tasks.json
 recordings/

@@ -3,7 +3,10 @@ import wave
 from voice_ai_bot.conversation import Message
 from voice_ai_bot.config import Config
 from voice_ai_bot.realtime_voice import (
+    ADD_SCHEDULED_TASK_TOOL_NAME,
     CLOSE_TOOL_NAME,
+    DELETE_SCHEDULED_TASK_TOOL_NAME,
+    LIST_SCHEDULED_TASKS_TOOL_NAME,
     START_TASK_TOOL_NAME,
     RealtimeConversationSession,
     conversation_item_for_message,
@@ -106,6 +109,9 @@ def test_realtime_tools_use_async_background_task_interface():
     assert "list_background_tasks" in tool_names
     assert "get_background_task" in tool_names
     assert "cancel_background_task" in tool_names
+    assert ADD_SCHEDULED_TASK_TOOL_NAME in tool_names
+    assert LIST_SCHEDULED_TASKS_TOOL_NAME in tool_names
+    assert DELETE_SCHEDULED_TASK_TOOL_NAME in tool_names
     assert "web_search" not in tool_names
 
 
@@ -170,6 +176,9 @@ def _config(tmp_path):
         record_channels=1,
         min_record_seconds=0.25,
         conversation_file=tmp_path / "conversation.json",
+        scheduled_tasks_file=tmp_path / "scheduled_tasks.json",
+        schedule_quiet_start="21:00",
+        schedule_quiet_end="07:30",
         recordings_dir=tmp_path / "recordings",
         tts_chunk_chars=240,
         log_level="INFO",

@@ -12,6 +12,7 @@ from .conversation import ConversationStore
 from .hardware import HatHardware
 from .openai_voice import OpenAIVoiceClient
 from .realtime_voice import RealtimeConversationSession
+from .scheduled_tasks import ScheduledTask, ScheduledTaskStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,8 +23,13 @@ class VoiceDaemon:
         self.hardware = HatHardware(config.button_gpio, config.led_gpio, config.button_pull_up)
         self.recorder = Recorder(config)
         self.conversation = ConversationStore(config.conversation_file)
+        self.scheduled_tasks = ScheduledTaskStore(config)
         self.openai = OpenAIVoiceClient(config) if config.voice_bot_backend == "responses" else None
-        self.realtime = RealtimeConversationSession(config) if config.voice_bot_backend == "realtime" else None
+        self.realtime = (
+            RealtimeConversationSession(config, self.scheduled_tasks)
+            if config.voice_bot_backend == "realtime"
+            else None
+        )
         self.running = True
         self._led_mode = "off"
         if config.voice_bot_backend == "realtime" and config.record_rate != config.realtime_input_rate:
@@ -65,6 +71,7 @@ class VoiceDaemon:
                 self.realtime.check_health()
                 self.realtime.close_if_too_old()
                 self.realtime.close_if_idle()
+                self._run_due_scheduled_tasks()
                 self._sync_realtime_led()
                 if not self.hardware.wait_for_press(timeout=0.05):
                     continue
@@ -126,6 +133,38 @@ class VoiceDaemon:
             self._set_led_mode("blink")
         else:
             self._set_led_mode("off")
+
+    def _run_due_scheduled_tasks(self) -> None:
+        if self.realtime is None or self.realtime.is_voice_busy:
+            return
+        for task in self.scheduled_tasks.due(limit=1):
+            if self._start_scheduled_task(task):
+                return
+
+    def _start_scheduled_task(self, task: ScheduledTask) -> bool:
+        assert self.realtime is not None
+        if task.action == "speak":
+            started = self.realtime.trigger_scheduled_speech(
+                self.conversation.load(),
+                title=task.title,
+                prompt=task.prompt,
+            )
+            if not started:
+                return False
+            self.scheduled_tasks.mark_started(task.id)
+            self._set_led_mode("blink")
+            LOGGER.info("started scheduled speech task %s: %s", task.id, task.title)
+            return True
+        if task.action == "background_task":
+            result = self.realtime.tasks.start(task.prompt, title=task.title)
+            if not result.get("ok"):
+                LOGGER.warning("failed to start scheduled background task %s: %s", task.id, result)
+                return False
+            self.scheduled_tasks.mark_started(task.id)
+            LOGGER.info("started scheduled background task %s: %s", task.id, task.title)
+            return True
+        LOGGER.warning("unknown scheduled task action %s for %s", task.action, task.id)
+        return False
 
     def _set_led_mode(self, mode: str) -> None:
         if self._led_mode == mode:

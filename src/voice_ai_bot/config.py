@@ -91,6 +91,9 @@ class Config:
     record_channels: int
     min_record_seconds: float
     conversation_file: Path
+    scheduled_tasks_file: Path
+    schedule_quiet_start: str
+    schedule_quiet_end: str
     recordings_dir: Path
     tts_chunk_chars: int
     log_level: str
@@ -160,6 +163,11 @@ class Config:
             record_channels=_int_env("RECORD_CHANNELS", 1),
             min_record_seconds=_float_env("MIN_RECORD_SECONDS", 0.25),
             conversation_file=Path(os.getenv("CONVERSATION_FILE", "/var/lib/voice-ai-bot/conversation.json")),
+            scheduled_tasks_file=Path(
+                os.getenv("SCHEDULED_TASKS_FILE", "/var/lib/voice-ai-bot/scheduled_tasks.json")
+            ),
+            schedule_quiet_start=os.getenv("SCHEDULE_QUIET_START", "21:00"),
+            schedule_quiet_end=os.getenv("SCHEDULE_QUIET_END", "07:30"),
             recordings_dir=Path(os.getenv("RECORDINGS_DIR", "/var/lib/voice-ai-bot/recordings")),
             tts_chunk_chars=_int_env("TTS_CHUNK_CHARS", 240),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

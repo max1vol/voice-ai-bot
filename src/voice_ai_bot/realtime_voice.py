@@ -23,6 +23,7 @@ from openai import OpenAI
 from .audio_io import PcmOutputStream, PcmPlayer, RawPcmRecorder
 from .config import Config, REALTIME_SYSTEM_PROMPT
 from .conversation import Message
+from .scheduled_tasks import ScheduledTaskStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,12 +34,18 @@ START_TASK_TOOL_NAME = "start_background_task"
 LIST_TASKS_TOOL_NAME = "list_background_tasks"
 GET_TASK_TOOL_NAME = "get_background_task"
 CANCEL_TASK_TOOL_NAME = "cancel_background_task"
+ADD_SCHEDULED_TASK_TOOL_NAME = "add_scheduled_task"
+LIST_SCHEDULED_TASKS_TOOL_NAME = "list_scheduled_tasks"
+DELETE_SCHEDULED_TASK_TOOL_NAME = "delete_scheduled_task"
 ASYNC_TASK_TOOL_NAMES = {
     START_TASK_TOOL_NAME,
     LIST_TASKS_TOOL_NAME,
     GET_TASK_TOOL_NAME,
     CANCEL_TASK_TOOL_NAME,
     WEB_SEARCH_TOOL_NAME,
+    ADD_SCHEDULED_TASK_TOOL_NAME,
+    LIST_SCHEDULED_TASKS_TOOL_NAME,
+    DELETE_SCHEDULED_TASK_TOOL_NAME,
 }
 
 
@@ -91,6 +98,10 @@ def realtime_session_instructions(config: Config) -> str:
         "When start_background_task returns a running task, briefly tell the user it started instead of polling "
         "repeatedly in the same response. Use list_background_tasks or get_background_task when the user asks "
         "what is running, asks for progress, or asks for results. "
+        "The user can ask you to create, list, or remove scheduled reminders, alarms, and other timed tasks. "
+        "Use the scheduled-task tools for that. Spoken scheduled tasks must not start during quiet hours "
+        f"{config.schedule_quiet_start}-{config.schedule_quiet_end} local time; if the requested time falls there, "
+        "explain that the device will stay quiet then and ask for another time. "
         "If interrupted by a new button press, stop the previous reply and treat the new speech as the latest user turn."
     )
 
@@ -99,7 +110,7 @@ def realtime_turn_instructions(config: Config) -> str:
     return (
         f"{local_context(config)} "
         "Answer the latest user turn. Keep spoken replies concise. "
-        "If using web_search, ask for exactly the information needed."
+        "Use background and scheduled-task tools when they fit the user's request."
     )
 
 
@@ -188,6 +199,77 @@ def realtime_tools() -> list[dict[str, Any]]:
                     "task_id": {
                         "type": "string",
                         "description": "Task id returned by start_background_task.",
+                    }
+                },
+                "required": ["task_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": ADD_SCHEDULED_TASK_TOOL_NAME,
+            "description": (
+                "Create a reminder, alarm, or other timed task. Use this when the user wants the device to do "
+                "something at a specific future time. Spoken tasks will be rejected during quiet hours."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short label for the scheduled task, such as 'Wake up' or 'Medication reminder'.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "What the assistant should say or do when the time arrives. For a spoken reminder, "
+                            "write the message to speak."
+                        ),
+                    },
+                    "run_at": {
+                        "type": "string",
+                        "description": (
+                            "ISO local datetime for when it should run, e.g. 2026-06-02T07:30:00. "
+                            "Use the current local time from the turn instructions to resolve relative requests."
+                        ),
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["speak", "background_task"],
+                        "description": "Use speak for alarms/reminders; use background_task for silent research/work.",
+                    },
+                    "repeat": {
+                        "type": "string",
+                        "enum": ["once", "daily"],
+                        "description": "Use daily for repeating alarms or reminders; otherwise use once.",
+                    },
+                },
+                "required": ["title", "prompt", "run_at"],
+            },
+        },
+        {
+            "type": "function",
+            "name": LIST_SCHEDULED_TASKS_TOOL_NAME,
+            "description": "List reminders, alarms, and other timed tasks so the user can review or discuss them.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_inactive": {
+                        "type": "boolean",
+                        "description": "Include completed and skipped items as well as active items.",
+                    }
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": DELETE_SCHEDULED_TASK_TOOL_NAME,
+            "description": "Remove a reminder, alarm, or other timed task by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Scheduled task id returned by add_scheduled_task or list_scheduled_tasks.",
                     }
                 },
                 "required": ["task_id"],
@@ -689,10 +771,11 @@ class RealtimeVoiceClient:
 
 
 class RealtimeConversationSession:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, scheduled_tasks: ScheduledTaskStore | None = None):
         self.config = config
         self.player = PcmPlayer(config.audio_playback_device)
         self.tasks = BackgroundTaskManager(config)
+        self.scheduled_tasks = scheduled_tasks or ScheduledTaskStore(config)
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
@@ -892,6 +975,11 @@ class RealtimeConversationSession:
         with self._state_lock:
             realtime_busy = self._response_pending or self._response_active or self._tool_active or self._playback is not None
         return realtime_busy or self.tasks.has_running()
+
+    @property
+    def is_voice_busy(self) -> bool:
+        with self._state_lock:
+            return self._is_busy_locked()
 
     def pop_completed_turns(self) -> list[RealtimeTurnResult]:
         turns: list[RealtimeTurnResult] = []
@@ -1118,7 +1206,71 @@ class RealtimeConversationSession:
             )
         if name == CANCEL_TASK_TOOL_NAME:
             return self.tasks.cancel(arguments.get("task_id", "").strip())
+        if name == ADD_SCHEDULED_TASK_TOOL_NAME:
+            return self.scheduled_tasks.add(
+                title=arguments.get("title", ""),
+                prompt=arguments.get("prompt", ""),
+                run_at=arguments.get("run_at", ""),
+                action=arguments.get("action", "speak"),
+                repeat=arguments.get("repeat", "once"),
+            )
+        if name == LIST_SCHEDULED_TASKS_TOOL_NAME:
+            return self.scheduled_tasks.list(include_inactive=bool(arguments.get("include_inactive", False)))
+        if name == DELETE_SCHEDULED_TASK_TOOL_NAME:
+            return self.scheduled_tasks.delete(arguments.get("task_id", "").strip())
         return {"ok": False, "error": f"unknown realtime tool: {name}"}
+
+    def trigger_scheduled_speech(self, history: Iterable[Message], title: str, prompt: str) -> bool:
+        self._raise_background_error()
+        title = title.strip() or "Scheduled task"
+        prompt = prompt.strip()
+        if not prompt:
+            LOGGER.warning("not starting scheduled speech with empty prompt")
+            return False
+        with self._state_lock:
+            if self._is_busy_locked():
+                return False
+            self._interrupt_response_locked()
+            self._reset_turn_text_locked()
+            self._input_transcript_final = f"[scheduled task: {title}] {prompt}"
+
+        self.ensure_open(history)
+        self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "A scheduled item is due now. "
+                                f"Title: {title}. Message/request: {prompt}"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+        self._send(
+            {
+                "type": "response.create",
+                "response": {
+                    "output_modalities": ["audio"],
+                    "instructions": (
+                        f"{local_context(self.config)} "
+                        "This scheduled item is due now. Speak naturally and concisely. "
+                        "Do not use implementation terminology."
+                    ),
+                },
+            }
+        )
+        with self._state_lock:
+            self._response_pending = True
+            self._last_activity_at = time.monotonic()
+        LOGGER.info("started scheduled speech: %s", title)
+        return True
 
     def _write_output_audio_locked(self, chunk: bytes) -> None:
         if not chunk:
