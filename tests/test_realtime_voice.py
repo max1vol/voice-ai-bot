@@ -154,6 +154,16 @@ def test_silent_cooldown_cancels_pending_response(tmp_path):
     assert ws.sent[0]["type"] == "response.cancel"
 
 
+def test_running_background_task_does_not_count_as_live_response(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    task = BackgroundTask(id="task_123", query="check weather", status="running")
+    session.tasks._tasks[task.id] = task
+
+    assert session.tasks.has_running()
+    assert not session.is_responding
+    assert not session.is_voice_busy
+
+
 def test_background_task_wakeup_queue_marks_reported(tmp_path):
     session = RealtimeConversationSession(_config(tmp_path))
     task = BackgroundTask(

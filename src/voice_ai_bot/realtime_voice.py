@@ -1037,8 +1037,7 @@ class RealtimeConversationSession:
     @property
     def is_responding(self) -> bool:
         with self._state_lock:
-            realtime_busy = self._response_pending or self._response_active or self._tool_active or self._playback is not None
-        return realtime_busy or self.tasks.has_running()
+            return self._response_pending or self._response_active or self._tool_active or self._playback is not None
 
     @property
     def is_voice_busy(self) -> bool:
