@@ -1,7 +1,6 @@
 [Unit]
 Description=Voice AI Bot
-After=network-online.target sound.target
-Wants=network-online.target
+After=sound.target
 
 [Service]
 Type=simple
