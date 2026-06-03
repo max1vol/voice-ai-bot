@@ -23,6 +23,7 @@ from voice_ai_bot.realtime_voice import (
     extract_response_text,
     iter_wav_pcm16_chunks,
     parse_tool_arguments,
+    realtime_session_instructions,
     realtime_tools,
     response_function_calls,
     response_requested_close,
@@ -139,6 +140,13 @@ def test_realtime_tools_use_async_background_task_interface():
     assert MEMORY_FORGET_TOOL_NAME in tool_names
     assert MEMORY_GET_SOURCE_TOOL_NAME in tool_names
     assert "web_search" not in tool_names
+
+
+def test_realtime_session_instructions_pin_max_code_identity(tmp_path):
+    instructions = realtime_session_instructions(_config(tmp_path))
+
+    assert "say that you are Max Code" in instructions
+    assert "Do not introduce yourself as ChatGPT" in instructions
 
 
 def test_interrupt_skips_truncate_when_session_is_closed(tmp_path):

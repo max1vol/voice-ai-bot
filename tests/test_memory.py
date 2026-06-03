@@ -95,6 +95,7 @@ def test_bootstrap_context_contains_max_code_identity(tmp_path):
     context = store.bootstrap_context()
 
     assert "Max Code" in context
+    assert "do not present yourself as ChatGPT" in context
     assert "Cambridge" in context
 
 

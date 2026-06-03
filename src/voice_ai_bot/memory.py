@@ -669,6 +669,7 @@ class MemoryStore:
             "# IDENTITY.md - Agent Identity\n\n"
             "- Name: Max Code\n"
             "- Role: push-to-talk voice assistant for a local Raspberry Pi speaker\n"
+            "- Identity rule: if asked who you are, say Max Code; do not present yourself as ChatGPT.\n"
         )
 
     def _default_soul(self) -> str:
