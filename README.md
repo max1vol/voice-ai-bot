@@ -15,6 +15,7 @@ Behavior:
 - Realtime turns include the current local time and user context for Cambridge, UK.
 - The realtime model has background task tools backed by GPT-5.5 with hosted web search, explicit user-facing status updates, and hosted code interpreter for current facts, calculations, code generation, and code checks.
 - Background tasks can be steered by later push-to-talk turns, and can wake the realtime model for important progress updates or final results, but unsolicited wakeups obey the same quiet-hours limit.
+- Max Code can list and play local songs from `/var/lib/voice-ai-bot/music`. Music listing includes durations, and music can be paused, resumed, stopped, or volume-adjusted by voice while a song is playing.
 - The realtime model can create, list, and remove scheduled reminders, alarms, and timed tasks. Scheduled speech is persisted as JSON and will not start during quiet hours: 21:00-07:30 local time.
 - Before calling OpenAI, the daemon waits for DNS and TCP connectivity to `api.openai.com`; this avoids losing the first turn while Wi-Fi is still settling after boot.
 
@@ -31,6 +32,10 @@ Memory works in two layers:
 ## Hardware Defaults
 
 The Google AIY Voice HAT uses GPIO 23 for the button and GPIO 25 for the LED. The daemon records and plays through ALSA device `plughw:1,0`, which is the HAT after enabling `dtoverlay=googlevoicehat-soundcard`.
+
+## Music
+
+Put 16-bit PCM WAV files in `/var/lib/voice-ai-bot/music`. The recommended format is 24 kHz mono PCM WAV, matching the realtime speaker stream. The bot exposes voice tools to list songs, play by title, pause, resume, stop, and set song volume. When the button is pressed during music playback, music pauses immediately; it resumes after the voice turn unless the user asked to pause, stop, or play something else.
 
 ## Pi Setup
 
@@ -72,6 +77,8 @@ TASK_MODEL=gpt-5.5
 TASK_REASONING_EFFORT=high
 TASK_REASONING_SUMMARY=auto
 TASK_CODE_EXECUTION=true
+MUSIC_DIR=/var/lib/voice-ai-bot/music
+MUSIC_VOLUME=8
 SCHEDULED_TASKS_FILE=/var/lib/voice-ai-bot/scheduled_tasks.json
 SCHEDULE_QUIET_START=21:00
 SCHEDULE_QUIET_END=07:30

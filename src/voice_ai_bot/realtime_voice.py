@@ -24,6 +24,7 @@ from .audio_io import PcmOutputStream, PcmPlayer, RawPcmRecorder
 from .config import Config, REALTIME_SYSTEM_PROMPT
 from .conversation import Message
 from .memory import MemoryStore
+from .music import MusicPlayer
 from .scheduled_tasks import ScheduledTaskStore
 from .weather import OpenWeatherService
 
@@ -43,6 +44,13 @@ LIST_SCHEDULED_TASKS_TOOL_NAME = "list_scheduled_tasks"
 DELETE_SCHEDULED_TASK_TOOL_NAME = "delete_scheduled_task"
 GET_WEATHER_TOOL_NAME = "get_weather"
 SET_VOICE_VOLUME_TOOL_NAME = "set_voice_volume"
+LIST_MUSIC_TOOL_NAME = "list_music"
+GET_MUSIC_STATUS_TOOL_NAME = "get_music_status"
+PLAY_MUSIC_TOOL_NAME = "play_music"
+PAUSE_MUSIC_TOOL_NAME = "pause_music"
+RESUME_MUSIC_TOOL_NAME = "resume_music"
+STOP_MUSIC_TOOL_NAME = "stop_music"
+SET_MUSIC_VOLUME_TOOL_NAME = "set_music_volume"
 MEMORY_SEARCH_TOOL_NAME = "memory_search"
 MEMORY_LIST_TOOL_NAME = "memory_list"
 MEMORY_ADD_TOOL_NAME = "memory_add"
@@ -61,6 +69,13 @@ ASYNC_TASK_TOOL_NAMES = {
     DELETE_SCHEDULED_TASK_TOOL_NAME,
     GET_WEATHER_TOOL_NAME,
     SET_VOICE_VOLUME_TOOL_NAME,
+    LIST_MUSIC_TOOL_NAME,
+    GET_MUSIC_STATUS_TOOL_NAME,
+    PLAY_MUSIC_TOOL_NAME,
+    PAUSE_MUSIC_TOOL_NAME,
+    RESUME_MUSIC_TOOL_NAME,
+    STOP_MUSIC_TOOL_NAME,
+    SET_MUSIC_VOLUME_TOOL_NAME,
     MEMORY_SEARCH_TOOL_NAME,
     MEMORY_LIST_TOOL_NAME,
     MEMORY_ADD_TOOL_NAME,
@@ -152,6 +167,11 @@ def realtime_session_instructions(config: Config, memory_context: str = "") -> s
         "user preferences, personal facts, or saved decisions. If the user asks you to remember something, call "
         "memory_add. If the user says memory is wrong, call memory_update. If the user asks to forget/delete/remove "
         "memory, call memory_forget. Confirm memory changes briefly. Do not store secrets or credentials. "
+        "For music, use list_music to see available songs and their durations, play_music to play a requested song, "
+        "pause_music, resume_music, stop_music, get_music_status, and set_music_volume for song playback volume. "
+        "Use set_voice_volume only for your spoken voice volume. If the user asks what songs are available, include "
+        "the song durations when helpful. If play_music or resume_music returns deferred true, briefly acknowledge; "
+        "the application starts or resumes music after you finish speaking so music and voice do not overlap. "
         "If interrupted by a new button press, stop the previous reply and treat the new speech as the latest user turn."
     ]
     if memory_context.strip():
@@ -403,6 +423,78 @@ def realtime_tools() -> list[dict[str, Any]]:
                         "minimum": 1,
                         "maximum": 10,
                         "description": "Voice volume level, where 1 is quietest and 10 is loudest.",
+                    }
+                },
+                "required": ["level"],
+            },
+        },
+        {
+            "type": "function",
+            "name": LIST_MUSIC_TOOL_NAME,
+            "description": (
+                "List songs available on the Raspberry Pi. The response includes each song's title, id, and "
+                "duration so you can tell the user what is available and how long it is."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": GET_MUSIC_STATUS_TOOL_NAME,
+            "description": "Get the current music playback state, selected song, position, pending action, and volume.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": PLAY_MUSIC_TOOL_NAME,
+            "description": (
+                "Play a song from the Raspberry Pi music library. Use the user's requested title or words, "
+                "such as baby shark or chopin spring. Playback starts after your spoken acknowledgement finishes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Song title, id, or user phrase to match against the local library.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "type": "function",
+            "name": PAUSE_MUSIC_TOOL_NAME,
+            "description": "Pause the currently playing song and keep its position for later resume.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": RESUME_MUSIC_TOOL_NAME,
+            "description": (
+                "Resume the selected paused song. Playback starts after your spoken acknowledgement finishes."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": STOP_MUSIC_TOOL_NAME,
+            "description": "Stop music playback and clear the selected song.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": SET_MUSIC_VOLUME_TOOL_NAME,
+            "description": (
+                "Set song playback volume from 1 to 10. Use this for music volume, not Max Code's spoken voice."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "Music volume level, where 1 is quietest and 10 is loudest.",
                     }
                 },
                 "required": ["level"],
@@ -1492,6 +1584,7 @@ class RealtimeConversationSession:
         config: Config,
         scheduled_tasks: ScheduledTaskStore | None = None,
         memory: MemoryStore | None = None,
+        music: MusicPlayer | None = None,
     ):
         self.config = config
         self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
@@ -1500,6 +1593,7 @@ class RealtimeConversationSession:
         self.memory.ensure_workspace()
         self.tasks = BackgroundTaskManager(config, self.memory)
         self.weather = OpenWeatherService(config)
+        self.music = music or MusicPlayer(config)
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
@@ -2107,6 +2201,20 @@ class RealtimeConversationSession:
         if name == SET_VOICE_VOLUME_TOOL_NAME:
             level = self.player.set_volume_level(int_argument(arguments, "level", self.player.volume_level()))
             return {"ok": True, "volume": level, "scale": level / 10.0}
+        if name == LIST_MUSIC_TOOL_NAME:
+            return self.music.list()
+        if name == GET_MUSIC_STATUS_TOOL_NAME:
+            return self.music.status()
+        if name == PLAY_MUSIC_TOOL_NAME:
+            return self.music.request_play(string_argument(arguments, "query"))
+        if name == PAUSE_MUSIC_TOOL_NAME:
+            return self.music.pause(reason="user")
+        if name == RESUME_MUSIC_TOOL_NAME:
+            return self.music.request_resume()
+        if name == STOP_MUSIC_TOOL_NAME:
+            return self.music.stop()
+        if name == SET_MUSIC_VOLUME_TOOL_NAME:
+            return self.music.set_volume(int_argument(arguments, "level", self.config.music_volume))
         if name == MEMORY_SEARCH_TOOL_NAME:
             return self.memory.search(
                 string_argument(arguments, "query"),
@@ -2148,6 +2256,12 @@ class RealtimeConversationSession:
     def _latest_history(self) -> list[Message]:
         with self._state_lock:
             return list(self._current_history)
+
+    def pause_music_for_voice(self) -> bool:
+        return self.music.pause_for_voice()
+
+    def apply_deferred_music_after_voice(self) -> None:
+        self.music.apply_deferred_after_voice()
 
     def trigger_scheduled_speech(self, history: Iterable[Message], title: str, prompt: str) -> bool:
         self._raise_background_error()

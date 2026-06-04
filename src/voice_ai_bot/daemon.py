@@ -49,6 +49,7 @@ class VoiceDaemon:
     def stop(self) -> None:
         self.running = False
         if self.realtime is not None:
+            self.realtime.music.stop()
             self.realtime.close()
         self.memory_consolidator.flush()
         self.hardware.off()
@@ -76,6 +77,8 @@ class VoiceDaemon:
             try:
                 self._drain_realtime_turns()
                 assert self.realtime is not None
+                if not self.realtime.is_voice_busy:
+                    self.realtime.apply_deferred_music_after_voice()
                 self.realtime.check_health()
                 self.realtime.close_if_too_old()
                 self.realtime.close_if_idle()
@@ -101,6 +104,7 @@ class VoiceDaemon:
         assert self.realtime is not None
         LOGGER.info("realtime button pressed")
         self._set_led_mode("on")
+        self.realtime.pause_music_for_voice()
         self.realtime.begin_turn(self.conversation.load())
         self.hardware.wait_for_release()
         duration = self.realtime.stop_recording()
@@ -116,10 +120,12 @@ class VoiceDaemon:
                 self.conversation.clear()
                 self.hardware.confirm_clear()
                 self._led_mode = "off"
+                self.realtime.apply_deferred_music_after_voice()
                 return
             LOGGER.info("ignoring short realtime recording: %.3fs", duration)
             self.realtime.clear_pending_input()
             self._set_led_mode("off")
+            self.realtime.apply_deferred_music_after_voice()
             return
 
         self.realtime.commit_recording()
@@ -159,12 +165,15 @@ class VoiceDaemon:
     def _start_scheduled_task(self, task: ScheduledTask) -> bool:
         assert self.realtime is not None
         if task.action == "speak":
+            paused_music = self.realtime.pause_music_for_voice()
             started = self.realtime.trigger_scheduled_speech(
                 self.conversation.load(),
                 title=task.title,
                 prompt=task.prompt,
             )
             if not started:
+                if paused_music:
+                    self.realtime.apply_deferred_music_after_voice()
                 return False
             self.scheduled_tasks.mark_started(task.id)
             self._set_led_mode("blink")
@@ -192,6 +201,7 @@ class VoiceDaemon:
         if self._quiet_for_unsolicited_speech():
             return
         for task in self.realtime.pending_background_wakeups(limit=1):
+            paused_music = self.realtime.pause_music_for_voice()
             if self.realtime.trigger_background_task_wakeup(self.conversation.load(), task):
                 task_id = str(task.get("id") or "")
                 wakeup = task.get("wakeup") if isinstance(task.get("wakeup"), dict) else {}
@@ -199,6 +209,8 @@ class VoiceDaemon:
                 self._set_led_mode("blink")
                 LOGGER.info("started background wakeup for task %s", task_id)
                 return
+            if paused_music:
+                self.realtime.apply_deferred_music_after_voice()
 
     def _quiet_for_unsolicited_speech(self) -> bool:
         try:

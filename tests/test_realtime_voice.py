@@ -10,6 +10,8 @@ from voice_ai_bot.realtime_voice import (
     CLOSE_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
     GET_WEATHER_TOOL_NAME,
+    GET_MUSIC_STATUS_TOOL_NAME,
+    LIST_MUSIC_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
     MEMORY_ADD_TOOL_NAME,
     MEMORY_FORGET_TOOL_NAME,
@@ -18,9 +20,14 @@ from voice_ai_bot.realtime_voice import (
     MEMORY_SEARCH_TOOL_NAME,
     MEMORY_UPDATE_TOOL_NAME,
     BackgroundTask,
+    PAUSE_MUSIC_TOOL_NAME,
+    PLAY_MUSIC_TOOL_NAME,
+    RESUME_MUSIC_TOOL_NAME,
     START_TASK_TOOL_NAME,
     STEER_TASK_TOOL_NAME,
+    SET_MUSIC_VOLUME_TOOL_NAME,
     SET_VOICE_VOLUME_TOOL_NAME,
+    STOP_MUSIC_TOOL_NAME,
     TASK_STATUS_TOOL_NAME,
     RealtimeConversationSession,
     BackgroundTaskManager,
@@ -170,6 +177,13 @@ def test_realtime_tools_use_async_background_task_interface():
     assert DELETE_SCHEDULED_TASK_TOOL_NAME in tool_names
     assert GET_WEATHER_TOOL_NAME in tool_names
     assert SET_VOICE_VOLUME_TOOL_NAME in tool_names
+    assert LIST_MUSIC_TOOL_NAME in tool_names
+    assert GET_MUSIC_STATUS_TOOL_NAME in tool_names
+    assert PLAY_MUSIC_TOOL_NAME in tool_names
+    assert PAUSE_MUSIC_TOOL_NAME in tool_names
+    assert RESUME_MUSIC_TOOL_NAME in tool_names
+    assert STOP_MUSIC_TOOL_NAME in tool_names
+    assert SET_MUSIC_VOLUME_TOOL_NAME in tool_names
     assert MEMORY_SEARCH_TOOL_NAME in tool_names
     assert MEMORY_LIST_TOOL_NAME in tool_names
     assert MEMORY_ADD_TOOL_NAME in tool_names
@@ -554,6 +568,59 @@ def test_set_voice_volume_tool_updates_player(tmp_path):
 
     assert output == {"ok": True, "volume": 4, "scale": 0.4}
     assert session.player.volume_level() == 4
+
+
+def test_music_tools_delegate_to_music_player(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    calls = []
+
+    class FakeMusic:
+        def list(self):
+            calls.append(("list",))
+            return {"ok": True, "songs": [{"title": "Baby Shark", "duration": "1:51"}]}
+
+        def status(self):
+            calls.append(("status",))
+            return {"ok": True, "state": "stopped"}
+
+        def request_play(self, query):
+            calls.append(("play", query))
+            return {"ok": True, "deferred": True}
+
+        def pause(self, reason="user"):
+            calls.append(("pause", reason))
+            return {"ok": True}
+
+        def request_resume(self):
+            calls.append(("resume",))
+            return {"ok": True, "deferred": True}
+
+        def stop(self):
+            calls.append(("stop",))
+            return {"ok": True}
+
+        def set_volume(self, level):
+            calls.append(("volume", level))
+            return {"ok": True, "volume": level}
+
+    session.music = FakeMusic()
+
+    assert session._execute_realtime_tool_call({"name": LIST_MUSIC_TOOL_NAME, "arguments": "{}"})["songs"][0]["duration"] == "1:51"
+    assert session._execute_realtime_tool_call({"name": GET_MUSIC_STATUS_TOOL_NAME, "arguments": "{}"})["state"] == "stopped"
+    assert session._execute_realtime_tool_call({"name": PLAY_MUSIC_TOOL_NAME, "arguments": json.dumps({"query": "baby shark"})})["deferred"]
+    assert session._execute_realtime_tool_call({"name": PAUSE_MUSIC_TOOL_NAME, "arguments": "{}"})["ok"]
+    assert session._execute_realtime_tool_call({"name": RESUME_MUSIC_TOOL_NAME, "arguments": "{}"})["deferred"]
+    assert session._execute_realtime_tool_call({"name": STOP_MUSIC_TOOL_NAME, "arguments": "{}"})["ok"]
+    assert session._execute_realtime_tool_call({"name": SET_MUSIC_VOLUME_TOOL_NAME, "arguments": json.dumps({"level": 6})})["volume"] == 6
+    assert calls == [
+        ("list",),
+        ("status",),
+        ("play", "baby shark"),
+        ("pause", "user"),
+        ("resume",),
+        ("stop",),
+        ("volume", 6),
+    ]
 
 
 def _config(tmp_path):

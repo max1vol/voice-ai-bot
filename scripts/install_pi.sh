@@ -14,13 +14,16 @@ if [[ ! -f "$repo_dir/.env" ]]; then
   exit 1
 fi
 
-ssh "$target" 'sudo install -d -o pi -g pi /opt/voice-ai-bot /var/lib/voice-ai-bot /var/lib/voice-ai-bot/recordings'
+ssh "$target" 'sudo install -d -o pi -g pi /opt/voice-ai-bot /var/lib/voice-ai-bot /var/lib/voice-ai-bot/recordings /var/lib/voice-ai-bot/music'
 
 rsync -az --delete \
   --exclude .git \
   --exclude .venv \
   --exclude build \
   --exclude dist \
+  --exclude .local-music \
+  --exclude '*.wav' \
+  --exclude '*.pcm' \
   --exclude '*.egg-info' \
   --exclude __pycache__ \
   --exclude .pytest_cache \

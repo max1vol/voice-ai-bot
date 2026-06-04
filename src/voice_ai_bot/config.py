@@ -113,6 +113,8 @@ class Config:
     openweather_timeout_seconds: float = 10.0
     weather_cache_seconds: float = 600.0
     voice_volume: int = 10
+    music_dir: Path = Path("/var/lib/voice-ai-bot/music")
+    music_volume: int = 8
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -211,4 +213,6 @@ class Config:
             openweather_timeout_seconds=_float_env("OPENWEATHER_TIMEOUT_SECONDS", 10.0),
             weather_cache_seconds=_float_env("WEATHER_CACHE_SECONDS", 600.0),
             voice_volume=max(1, min(10, _int_env("VOICE_VOLUME", 10))),
+            music_dir=Path(os.getenv("MUSIC_DIR", "/var/lib/voice-ai-bot/music")),
+            music_volume=max(1, min(10, _int_env("MUSIC_VOLUME", 8))),
         )
