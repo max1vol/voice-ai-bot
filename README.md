@@ -33,6 +33,12 @@ Memory works in two layers:
 
 The Google AIY Voice HAT uses GPIO 23 for the button and GPIO 25 for the LED. The daemon records and plays through ALSA device `plughw:1,0`, which is the HAT after enabling `dtoverlay=googlevoicehat-soundcard`.
 
+## Max AI Watch
+
+The companion LILYGO T-Watch 2020 V1 firmware lives in `watch/max-ai-watch`. It is a PlatformIO project for the "Max AI Watch" watchface, Wi-Fi/NTP time sync, Cambridge weather display, drawer controls, and on-watch OpenAI TTS time announcements.
+
+The real watch secrets file is not committed. See `watch/max-ai-watch/README.md` for dependency setup, `src/secrets.h` generation, build, flash, and serial monitor commands.
+
 ## Music
 
 Put 16-bit PCM WAV files in `/var/lib/voice-ai-bot/music`. The recommended format is 24 kHz mono PCM WAV, matching the realtime speaker stream. The bot exposes voice tools to list songs, play by title, pause, resume, stop, and set song volume. When the button is pressed during music playback, music pauses immediately; it resumes after the voice turn unless the user asked to pause, stop, or play something else.

@@ -19,3 +19,5 @@ build/
 conversation.json
 scheduled_tasks.json
 recordings/
+watch/.platformio/
+watch/TTGO_TWatch_Library
