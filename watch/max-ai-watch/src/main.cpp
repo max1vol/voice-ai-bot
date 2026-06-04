@@ -129,6 +129,10 @@ WeatherStatus cachedWeather {false, 0, false, "", 0, 0};
 RTC_DATA_ATTR WeatherStatus rtcCachedWeather {false, 0, false, "", 0, 0};
 RTC_DATA_ATTR time_t rtcLastNtpSyncEpoch = 0;
 
+void refreshStatusIcons(bool force = false);
+void serviceUiDuringBlocking();
+void delayWithUi(uint32_t durationMs);
+
 struct BatteryStatus {
     int percent;
     bool valid;
@@ -377,6 +381,7 @@ void shutdownRadio(const char *reason)
     wifiIconCacheReady = false;
     lastDrawnWifiBars = -99;
     activeWifiNetworkIndex = -1;
+    refreshStatusIcons(true);
 }
 
 void drawWifiIcon(int bars)
@@ -471,6 +476,24 @@ void drawStatusIcons()
     }
 }
 
+void refreshStatusIcons(bool force)
+{
+    if (display == nullptr || !backlightOn || drawerOpen) {
+        return;
+    }
+
+    if (force) {
+        wifiIconCacheReady = false;
+        batteryCacheReady = false;
+        lastDrawnWifiBars = -99;
+        lastDrawnBatteryPercent = -99;
+        lastDrawnBatteryValid = false;
+        lastDrawnBatteryCharging = false;
+        lastDrawnExternalPower = false;
+    }
+    drawStatusIcons();
+}
+
 bool getLocalTimeInfo(tm &info, uint32_t timeoutMs = 10)
 {
     return getLocalTime(&info, timeoutMs);
@@ -510,7 +533,7 @@ bool syncTimeFromNtp()
             Serial.println(stamp);
             return true;
         }
-        delay(100);
+        delayWithUi(100);
     }
     Serial.println("[time] NTP sync failed; will retry");
     return false;
@@ -552,13 +575,14 @@ void connectWifi()
     WiFi.begin(WIFI_SSIDS[activeWifiNetworkIndex], WIFI_PASSWORDS[activeWifiNetworkIndex]);
     lastWifiAttemptMs = millis();
     wifiIconCacheReady = false;
+    refreshStatusIcons(true);
 }
 
 bool waitForWifi(uint32_t timeoutMs)
 {
     const uint32_t started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < timeoutMs) {
-        delay(250);
+        delayWithUi(250);
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -566,6 +590,7 @@ bool waitForWifi(uint32_t timeoutMs)
         Serial.print(WiFi.SSID());
         Serial.print(", IP=");
         Serial.println(WiFi.localIP());
+        refreshStatusIcons(true);
         return true;
     }
 
@@ -1375,9 +1400,37 @@ void maintainBacklight()
 {
     maintainTouchWake();
 
-    if (backlightOn && millis() - lastBacklightWakeMs > kBacklightTimeoutMs) {
+    if (!ttsBusy && backlightOn && millis() - lastBacklightWakeMs > kBacklightTimeoutMs) {
         sleepBacklight();
     }
+}
+
+void serviceUiDuringBlocking()
+{
+    if (display == nullptr || watch == nullptr) {
+        return;
+    }
+
+    maintainTouchWake();
+    maintainHeaderStatus();
+    refreshStatusIcons();
+    if (backlightOn && drawerOpen) {
+        drawDrawer();
+    }
+}
+
+void delayWithUi(uint32_t durationMs)
+{
+    const uint32_t started = millis();
+    do {
+        serviceUiDuringBlocking();
+        const uint32_t elapsed = millis() - started;
+        if (elapsed >= durationMs) {
+            break;
+        }
+        const uint32_t remaining = durationMs - elapsed;
+        delay(remaining > 35 ? 35 : remaining);
+    } while (true);
 }
 
 enum class SpeechDownloadResult : uint8_t {
@@ -1414,6 +1467,7 @@ SpeechDownloadResult downloadSpeechMp3(const String &input)
     }
     Serial.println("[tts] OpenAI connection established");
     setHeaderStatus("waiting tts...");
+    serviceUiDuringBlocking();
 
     HTTPClient http;
     http.setTimeout(20000);
@@ -1440,7 +1494,9 @@ SpeechDownloadResult downloadSpeechMp3(const String &input)
 
     Serial.print("[tts] requesting: ");
     Serial.println(input);
+    serviceUiDuringBlocking();
     const int code = http.POST(body);
+    serviceUiDuringBlocking();
     if (code != HTTP_CODE_OK) {
         Serial.print("[tts] OpenAI HTTP error: ");
         Serial.println(code);
@@ -1455,6 +1511,7 @@ SpeechDownloadResult downloadSpeechMp3(const String &input)
     }
 
     const int written = http.writeToStream(&speech);
+    serviceUiDuringBlocking();
     http.end();
     speech.close();
 
@@ -1478,7 +1535,7 @@ bool playSpeechMp3()
 
     Serial.println("[audio] playing speech");
     watch->enableLDO3(true);
-    delay(50);
+    delayWithUi(50);
 
     AudioFileSourceSPIFFS *file = new AudioFileSourceSPIFFS(kSpeechPath);
     AudioFileSourceID3 *id3 = new AudioFileSourceID3(file);
@@ -1488,7 +1545,13 @@ bool playSpeechMp3()
 
     AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
     bool ok = mp3->begin(id3, out);
+    float appliedVolume = speechVolume;
     while (ok && mp3->isRunning()) {
+        serviceUiDuringBlocking();
+        if (fabsf(speechVolume - appliedVolume) > 0.01f) {
+            appliedVolume = speechVolume;
+            out->SetGain(appliedVolume);
+        }
         if (!mp3->loop()) {
             mp3->stop();
         }
