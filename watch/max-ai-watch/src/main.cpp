@@ -29,11 +29,12 @@ constexpr uint32_t kDrawerAutoCloseMs = 10000;
 constexpr uint32_t kTouchTapSuppressMs = 600;
 constexpr uint32_t kTripleTapWindowMs = 900;
 constexpr uint32_t kTapMaxDurationMs = 700;
+constexpr uint32_t kHeaderErrorMs = 10000;
 constexpr uint8_t kMinBrightness = 25;
 constexpr int kScreenH = 240;
 constexpr int kDrawerX = 8;
 constexpr int kDrawerW = 224;
-constexpr int kDrawerH = 204;
+constexpr int kDrawerH = kScreenH - (kDrawerX * 2);
 constexpr int kDrawerY = (kScreenH - kDrawerH) / 2;
 constexpr int kDrawerCloseButtonR = 15;
 constexpr int kDrawerCloseButtonX = kDrawerCloseButtonR;
@@ -43,11 +44,12 @@ constexpr int kSliderX = 38;
 constexpr int kSliderW = 164;
 constexpr int kSliderTrackH = 10;
 constexpr int kSliderKnobR = 12;
-constexpr int kBrightnessSliderY = kDrawerY + 54;
-constexpr int kVolumeSliderY = kDrawerY + 114;
-constexpr int kVoiceToggleY = kDrawerY + 172;
+constexpr int kBrightnessSliderY = kDrawerY + 62;
+constexpr int kVolumeSliderY = kDrawerY + 132;
+constexpr int kVoiceToggleY = kDrawerY + 196;
 constexpr int kTapMaxTravel = 48;
 constexpr char kSpeechPath[] = "/speech.mp3";
+constexpr char kHeaderDefaultText[] = "Max AI Watch";
 
 TTGOClass *watch = nullptr;
 TFT_eSPI *display = nullptr;
@@ -73,8 +75,11 @@ uint32_t suppressVoiceToggleUntilMs = 0;
 uint32_t touchStartMs = 0;
 uint32_t lastTapMs = 0;
 uint32_t pendingTouchTtsAtMs = 0;
+uint32_t headerStatusUntilMs = 0;
 int lastPmuIntPinLevel = -1;
 char lastStatusText[48] = "";
+char headerStatusText[24] = "Max AI Watch";
+char lastHeaderStatusText[24] = "";
 volatile bool powerButtonIrq = false;
 int nextWifiNetworkIndex = 0;
 int activeWifiNetworkIndex = -1;
@@ -92,6 +97,9 @@ bool drawerOpen = false;
 bool drawerNeedsRedraw = false;
 bool voiceEnabled = true;
 bool voiceToggleTouchConsumed = false;
+bool headerStatusError = false;
+bool lastHeaderStatusError = false;
+bool lastWeatherFetchNetworkError = false;
 uint8_t tapCount = 0;
 uint32_t drawerLastInteractionMs = 0;
 
@@ -150,16 +158,67 @@ void drawPanel(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t border)
     display->drawRoundRect(x, y, w, h, 8, border);
 }
 
+void drawHeaderStatus(bool force = false)
+{
+    if (display == nullptr || drawerOpen) {
+        return;
+    }
+    if (
+        !force &&
+        strcmp(headerStatusText, lastHeaderStatusText) == 0 &&
+        headerStatusError == lastHeaderStatusError
+    ) {
+        return;
+    }
+
+    strlcpy(lastHeaderStatusText, headerStatusText, sizeof(lastHeaderStatusText));
+    lastHeaderStatusError = headerStatusError;
+
+    display->fillRect(58, 22, 124, 18, TFT_BLACK);
+    display->setTextDatum(MC_DATUM);
+    display->setTextColor(
+        headerStatusError ? dimColor(255, 68, 82) : dimColor(198, 245, 255),
+        TFT_BLACK
+    );
+    display->drawString(headerStatusText, 120, 31, 2);
+}
+
+void setHeaderStatus(const char *text, bool isError = false, uint32_t durationMs = 0)
+{
+    strlcpy(headerStatusText, text, sizeof(headerStatusText));
+    headerStatusError = isError;
+    headerStatusUntilMs = isError && durationMs > 0 ? millis() + durationMs : 0;
+    if (backlightOn) {
+        drawHeaderStatus();
+    }
+}
+
+void clearHeaderStatus()
+{
+    setHeaderStatus(kHeaderDefaultText);
+}
+
+void setHeaderError(const char *text)
+{
+    setHeaderStatus(text, true, kHeaderErrorMs);
+}
+
+void maintainHeaderStatus()
+{
+    if (headerStatusError && headerStatusUntilMs > 0 && millis() >= headerStatusUntilMs) {
+        clearHeaderStatus();
+    } else if (backlightOn) {
+        drawHeaderStatus();
+    }
+}
+
 void drawStaticFace()
 {
     display->pushImage(0, 0, MAX_AI_FACE_WIDTH, MAX_AI_FACE_HEIGHT, maxAiFace);
     drawPanel(16, 14, 208, 34, dimColor(24, 90, 120));
     drawPanel(15, 68, 210, 76, dimColor(35, 130, 170));
     drawPanel(28, 168, 184, 44, dimColor(95, 72, 36));
-
-    display->setTextDatum(MC_DATUM);
-    display->setTextColor(dimColor(198, 245, 255), TFT_BLACK);
-    display->drawString("Max AI Watch", 120, 31, 2);
+    drawHeaderStatus(true);
 }
 
 int wifiSignalBars()
@@ -506,9 +565,11 @@ bool isCloudyCondition(const char *condition)
 
 bool fetchWeatherForecast()
 {
+    lastWeatherFetchNetworkError = false;
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[weather] skipped: WiFi is not connected");
-        return cachedWeather.valid;
+        lastWeatherFetchNetworkError = true;
+        return false;
     }
 
     WiFiClientSecure client;
@@ -522,7 +583,8 @@ bool fetchWeatherForecast()
     url += OPENWEATHER_API_KEY;
     if (!http.begin(client, url)) {
         Serial.println("[weather] HTTP begin failed");
-        return cachedWeather.valid;
+        lastWeatherFetchNetworkError = true;
+        return false;
     }
 
     Serial.println("[weather] fetching Cambridge forecast");
@@ -531,7 +593,10 @@ bool fetchWeatherForecast()
         Serial.print("[weather] HTTP error: ");
         Serial.println(code);
         http.end();
-        return cachedWeather.valid;
+        if (code <= 0) {
+            lastWeatherFetchNetworkError = true;
+        }
+        return false;
     }
 
     DynamicJsonDocument doc(24576);
@@ -540,13 +605,13 @@ bool fetchWeatherForecast()
     if (error) {
         Serial.print("[weather] JSON parse failed: ");
         Serial.println(error.c_str());
-        return cachedWeather.valid;
+        return false;
     }
 
     JsonArray list = doc["list"].as<JsonArray>();
     if (list.isNull() || list.size() == 0) {
         Serial.println("[weather] empty forecast");
-        return cachedWeather.valid;
+        return false;
     }
 
     JsonObject first = list[0];
@@ -600,7 +665,7 @@ bool ensureWeatherForecast()
 
 String weatherSpeechClause()
 {
-    if (!ensureWeatherForecast() || !cachedWeather.valid) {
+    if (!cachedWeather.valid) {
         return "";
     }
 
@@ -730,6 +795,7 @@ void resetDrawState()
     lastMinuteOfDay = -1;
     lastYearDay = -1;
     lastStatusText[0] = '\0';
+    lastHeaderStatusText[0] = '\0';
     lastDrawnWifiBars = -99;
     lastDrawnBatteryPercent = -99;
     lastDrawnBatteryValid = false;
@@ -748,6 +814,7 @@ void drawWatchFace(const tm &info)
 
     display->setTextDatum(MC_DATUM);
     drawStatusIcons();
+    drawHeaderStatus();
 
     const int minuteOfDay = info.tm_hour * 60 + info.tm_min;
     if (minuteOfDay != lastMinuteOfDay) {
@@ -1242,18 +1309,24 @@ void maintainBacklight()
     }
 }
 
-bool downloadSpeechMp3(const String &input)
+enum class SpeechDownloadResult : uint8_t {
+    Ok,
+    NetworkError,
+    TtsError
+};
+
+SpeechDownloadResult downloadSpeechMp3(const String &input)
 {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[tts] skipped: WiFi is not connected");
-        return false;
+        return SpeechDownloadResult::NetworkError;
     }
 
     SPIFFS.remove(kSpeechPath);
     fs::File speech = SPIFFS.open(kSpeechPath, FILE_WRITE);
     if (!speech) {
         Serial.println("[tts] failed to open speech file for writing");
-        return false;
+        return SpeechDownloadResult::TtsError;
     }
 
     WiFiClientSecure client;
@@ -1265,7 +1338,7 @@ bool downloadSpeechMp3(const String &input)
     if (!http.begin(client, "https://api.openai.com/v1/audio/speech")) {
         Serial.println("[tts] HTTP begin failed");
         speech.close();
-        return false;
+        return SpeechDownloadResult::NetworkError;
     }
 
     String auth = "Bearer ";
@@ -1294,7 +1367,7 @@ bool downloadSpeechMp3(const String &input)
         http.end();
         speech.close();
         SPIFFS.remove(kSpeechPath);
-        return false;
+        return code <= 0 ? SpeechDownloadResult::NetworkError : SpeechDownloadResult::TtsError;
     }
 
     const int written = http.writeToStream(&speech);
@@ -1304,12 +1377,12 @@ bool downloadSpeechMp3(const String &input)
     if (written <= 0) {
         Serial.println("[tts] no MP3 bytes written");
         SPIFFS.remove(kSpeechPath);
-        return false;
+        return SpeechDownloadResult::NetworkError;
     }
 
     Serial.print("[tts] MP3 bytes saved: ");
     Serial.println(written);
-    return true;
+    return SpeechDownloadResult::Ok;
 }
 
 bool playSpeechMp3()
@@ -1363,17 +1436,48 @@ void handleTtsRequest()
     suppressTouchTap(1500);
     wakeBacklight("tts");
 
+    setHeaderStatus("connecting...");
+    if (WiFi.status() != WL_CONNECTED && !connectWifiOrdered(5000)) {
+        setHeaderError("net error");
+        ttsBusy = false;
+        resetTouchState();
+        suppressTouchTap(1200);
+        return;
+    }
+
+    setHeaderStatus("weather...");
+    if (!ensureWeatherForecast()) {
+        setHeaderError(lastWeatherFetchNetworkError ? "net error" : "weather error");
+        ttsBusy = false;
+        resetTouchState();
+        suppressTouchTap(1200);
+        return;
+    }
+
     tm info {};
     if (!getLocalTimeInfo(info, 250)) {
         Serial.println("[tts] no valid local time");
+        setHeaderError("tts error");
         ttsBusy = false;
         resetTouchState();
+        suppressTouchTap(1200);
         return;
     }
 
     const String phrase = spokenTimePhrase(info);
-    if (downloadSpeechMp3(phrase)) {
-        playSpeechMp3();
+    setHeaderStatus("calling tts....");
+    const SpeechDownloadResult downloadResult = downloadSpeechMp3(phrase);
+    if (downloadResult == SpeechDownloadResult::Ok) {
+        setHeaderStatus("speaking...");
+        if (playSpeechMp3()) {
+            clearHeaderStatus();
+        } else {
+            setHeaderError("tts error");
+        }
+    } else if (downloadResult == SpeechDownloadResult::NetworkError) {
+        setHeaderError("net error");
+    } else {
+        setHeaderError("tts error");
     }
 
     lastBacklightWakeMs = millis();
@@ -1438,6 +1542,7 @@ void loop()
     maintainWeather();
     maintainBacklight();
     handleTtsRequest();
+    maintainHeaderStatus();
 
     if (backlightOn && drawerOpen) {
         drawDrawer();

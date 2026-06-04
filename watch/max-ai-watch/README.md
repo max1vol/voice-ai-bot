@@ -10,6 +10,15 @@ The watchface shows:
 - A triple-tap drawer with brightness, volume, and Voice toggle controls.
 - A physical-button TTS route that speaks the current time and weather through the watch speaker.
 
+## Controls
+
+- Press the physical side/power button to speak the current time and weather.
+- Triple-tap the touchscreen to open the drawer.
+- Tap the top-left `X` button to close the drawer.
+- Use the drawer Voice toggle to disable or re-enable TTS.
+
+During a TTS request, the header replaces `Max AI Watch` with `connecting...`, `weather...`, `calling tts....`, and `speaking...`. Network, weather, and TTS errors are shown in red for 10 seconds or until the next status.
+
 ## Hardware
 
 Target hardware:
