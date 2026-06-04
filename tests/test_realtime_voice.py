@@ -8,6 +8,7 @@ from voice_ai_bot.realtime_voice import (
     ADD_SCHEDULED_TASK_TOOL_NAME,
     CLOSE_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
+    GET_WEATHER_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
     MEMORY_ADD_TOOL_NAME,
     MEMORY_FORGET_TOOL_NAME,
@@ -17,6 +18,7 @@ from voice_ai_bot.realtime_voice import (
     MEMORY_UPDATE_TOOL_NAME,
     BackgroundTask,
     START_TASK_TOOL_NAME,
+    SET_VOICE_VOLUME_TOOL_NAME,
     RealtimeConversationSession,
     conversation_item_for_message,
     event_is_ignorable_control_error,
@@ -133,6 +135,8 @@ def test_realtime_tools_use_async_background_task_interface():
     assert ADD_SCHEDULED_TASK_TOOL_NAME in tool_names
     assert LIST_SCHEDULED_TASKS_TOOL_NAME in tool_names
     assert DELETE_SCHEDULED_TASK_TOOL_NAME in tool_names
+    assert GET_WEATHER_TOOL_NAME in tool_names
+    assert SET_VOICE_VOLUME_TOOL_NAME in tool_names
     assert MEMORY_SEARCH_TOOL_NAME in tool_names
     assert MEMORY_LIST_TOOL_NAME in tool_names
     assert MEMORY_ADD_TOOL_NAME in tool_names
@@ -333,6 +337,39 @@ def test_memory_tool_arguments_are_tolerant(tmp_path):
     )
 
     assert output["ok"]
+
+
+def test_weather_tool_passes_cache_and_location_arguments(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    calls = []
+
+    class FakeWeather:
+        def get_current_weather(self, location="", units="metric", no_cache=False):
+            calls.append((location, units, no_cache))
+            return {"ok": True, "location_query": location, "cached": not no_cache}
+
+    session.weather = FakeWeather()
+
+    output = session._execute_realtime_tool_call(
+        {
+            "name": GET_WEATHER_TOOL_NAME,
+            "arguments": json.dumps({"location": "London,GB", "units": "metric", "no_cache": True}),
+        }
+    )
+
+    assert output["ok"]
+    assert calls == [("London,GB", "metric", True)]
+
+
+def test_set_voice_volume_tool_updates_player(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+
+    output = session._execute_realtime_tool_call(
+        {"name": SET_VOICE_VOLUME_TOOL_NAME, "arguments": json.dumps({"level": 4})}
+    )
+
+    assert output == {"ok": True, "volume": 4, "scale": 0.4}
+    assert session.player.volume_level() == 4
 
 
 def _config(tmp_path):

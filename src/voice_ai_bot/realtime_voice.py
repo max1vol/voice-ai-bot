@@ -25,6 +25,7 @@ from .config import Config, REALTIME_SYSTEM_PROMPT
 from .conversation import Message
 from .memory import MemoryStore
 from .scheduled_tasks import ScheduledTaskStore
+from .weather import OpenWeatherService
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ CANCEL_TASK_TOOL_NAME = "cancel_background_task"
 ADD_SCHEDULED_TASK_TOOL_NAME = "add_scheduled_task"
 LIST_SCHEDULED_TASKS_TOOL_NAME = "list_scheduled_tasks"
 DELETE_SCHEDULED_TASK_TOOL_NAME = "delete_scheduled_task"
+GET_WEATHER_TOOL_NAME = "get_weather"
+SET_VOICE_VOLUME_TOOL_NAME = "set_voice_volume"
 MEMORY_SEARCH_TOOL_NAME = "memory_search"
 MEMORY_LIST_TOOL_NAME = "memory_list"
 MEMORY_ADD_TOOL_NAME = "memory_add"
@@ -53,6 +56,8 @@ ASYNC_TASK_TOOL_NAMES = {
     ADD_SCHEDULED_TASK_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
+    GET_WEATHER_TOOL_NAME,
+    SET_VOICE_VOLUME_TOOL_NAME,
     MEMORY_SEARCH_TOOL_NAME,
     MEMORY_LIST_TOOL_NAME,
     MEMORY_ADD_TOOL_NAME,
@@ -111,8 +116,11 @@ def realtime_session_instructions(config: Config, memory_context: str = "") -> s
         "Use the user's current local time, date, timezone, and location for words like today, tomorrow, "
         "local, nearby, morning, evening, and current. "
         "Use start_background_task when the user asks about current, recent, local, weather, news, opening-hours, "
-        "price, schedule, or otherwise time-sensitive facts. Prefer the background task tools for web, code, "
-        "calculation, or multi-step research so the voice session stays interruptible. "
+        "Use get_weather for current weather; it caches results for 10 minutes, and you should set no_cache true "
+        "only when the user explicitly asks to refresh or recheck the weather. Use start_background_task when the "
+        "user asks about other current, recent, local, news, opening-hours, price, schedule, or otherwise "
+        "time-sensitive facts. Prefer the background task tools for web, code, calculation, or multi-step research "
+        "so the voice session stays interruptible. "
         "Background GPT-5.5 tasks receive the user's current local time, timezone, and location, and can use "
         "hosted web search plus code execution. "
         "When start_background_task returns a running task, briefly tell the user it started instead of polling "
@@ -312,6 +320,52 @@ def realtime_tools() -> list[dict[str, Any]]:
                     }
                 },
                 "required": ["task_id"],
+            },
+        },
+        {
+            "type": "function",
+            "name": GET_WEATHER_TOOL_NAME,
+            "description": (
+                "Get current weather from OpenWeather. Use this for weather questions instead of web search. "
+                "Results are cached for 10 minutes unless no_cache is true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "Location name such as Cambridge, GB. Omit to use the user's configured city.",
+                    },
+                    "units": {
+                        "type": "string",
+                        "enum": ["metric", "imperial", "standard"],
+                        "description": "Unit system. Use metric by default for Cambridge, UK.",
+                    },
+                    "no_cache": {
+                        "type": "boolean",
+                        "description": "Set true only when the user explicitly asks to refresh or recheck.",
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": SET_VOICE_VOLUME_TOOL_NAME,
+            "description": (
+                "Set Max Code's spoken output volume from 1 to 10. This adjusts software PCM volume before "
+                "audio is sent to the speaker."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "Voice volume level, where 1 is quietest and 10 is loudest.",
+                    }
+                },
+                "required": ["level"],
             },
         },
         {
@@ -772,7 +826,7 @@ def _truncate(text: str, max_chars: int, keep_tail: bool = False) -> str:
 class RealtimeVoiceClient:
     def __init__(self, config: Config):
         self.config = config
-        self.player = PcmPlayer(config.audio_playback_device)
+        self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
 
     def wait_for_connectivity(self) -> None:
         host = self.config.openai_connectivity_host
@@ -975,10 +1029,11 @@ class RealtimeConversationSession:
         memory: MemoryStore | None = None,
     ):
         self.config = config
-        self.player = PcmPlayer(config.audio_playback_device)
+        self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
         self.tasks = BackgroundTaskManager(config)
         self.scheduled_tasks = scheduled_tasks or ScheduledTaskStore(config)
         self.memory = memory or MemoryStore(config)
+        self.weather = OpenWeatherService(config)
         self.memory.ensure_workspace()
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
@@ -1559,6 +1614,15 @@ class RealtimeConversationSession:
             )
         if name == DELETE_SCHEDULED_TASK_TOOL_NAME:
             return self.scheduled_tasks.delete(string_argument(arguments, "task_id"))
+        if name == GET_WEATHER_TOOL_NAME:
+            return self.weather.get_current_weather(
+                location=string_argument(arguments, "location"),
+                units=string_argument(arguments, "units", "metric"),
+                no_cache=parse_bool_argument(arguments.get("no_cache"), default=False),
+            )
+        if name == SET_VOICE_VOLUME_TOOL_NAME:
+            level = self.player.set_volume_level(int_argument(arguments, "level", self.player.volume_level()))
+            return {"ok": True, "volume": level, "scale": level / 10.0}
         if name == MEMORY_SEARCH_TOOL_NAME:
             return self.memory.search(
                 string_argument(arguments, "query"),

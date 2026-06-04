@@ -115,7 +115,7 @@ class OpenAIVoiceClient:
     def __init__(self, config: Config):
         self.config = config
         self.client = OpenAI(api_key=config.openai_api_key, timeout=config.openai_timeout_seconds)
-        self.player = PcmPlayer(config.audio_playback_device)
+        self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
 
     def wait_for_connectivity(self) -> None:
         host = self.config.openai_connectivity_host

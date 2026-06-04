@@ -109,6 +109,10 @@ class Config:
     memory_consolidation_shutdown_timeout_seconds: float = 30.0
     memory_consolidation_max_notes: int = 12
     memory_consolidation_max_chars: int = 16000
+    openweather_api_key: str = ""
+    openweather_timeout_seconds: float = 10.0
+    weather_cache_seconds: float = 600.0
+    voice_volume: int = 10
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -203,4 +207,8 @@ class Config:
             ),
             memory_consolidation_max_notes=_int_env("MEMORY_CONSOLIDATION_MAX_NOTES", 12),
             memory_consolidation_max_chars=_int_env("MEMORY_CONSOLIDATION_MAX_CHARS", 16000),
+            openweather_api_key=os.getenv("OPENWEATHER_API_KEY", "").strip(),
+            openweather_timeout_seconds=_float_env("OPENWEATHER_TIMEOUT_SECONDS", 10.0),
+            weather_cache_seconds=_float_env("WEATHER_CACHE_SECONDS", 600.0),
+            voice_volume=max(1, min(10, _int_env("VOICE_VOLUME", 10))),
         )

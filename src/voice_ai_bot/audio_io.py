@@ -3,8 +3,11 @@ from __future__ import annotations
 import logging
 import signal
 import subprocess
+import sys
 import threading
 import time
+from array import array
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -87,8 +90,10 @@ class Recorder:
 
 
 class PcmPlayer:
-    def __init__(self, playback_device: str):
+    def __init__(self, playback_device: str, volume_level: int = 10):
         self.playback_device = playback_device
+        self._volume_lock = threading.Lock()
+        self._volume_level = clamp_volume_level(volume_level)
 
     def play_pcm_stream(self, chunks) -> None:
         with self.open_stream() as stream:
@@ -96,14 +101,32 @@ class PcmPlayer:
                 stream.write(chunk)
 
     def open_stream(self, rate: int = 24000, channels: int = 1) -> "PcmOutputStream":
-        return PcmOutputStream(self.playback_device, rate, channels)
+        return PcmOutputStream(self.playback_device, rate, channels, self.volume_level)
+
+    def set_volume_level(self, level: int) -> int:
+        clean_level = clamp_volume_level(level)
+        with self._volume_lock:
+            self._volume_level = clean_level
+        LOGGER.info("software voice volume set to %d/10", clean_level)
+        return clean_level
+
+    def volume_level(self) -> int:
+        with self._volume_lock:
+            return self._volume_level
 
 
 class PcmOutputStream:
-    def __init__(self, playback_device: str, rate: int, channels: int):
+    def __init__(
+        self,
+        playback_device: str,
+        rate: int,
+        channels: int,
+        volume_getter: Callable[[], int] | None = None,
+    ):
         self.playback_device = playback_device
         self.rate = rate
         self.channels = channels
+        self.volume_getter = volume_getter
         self.process: subprocess.Popen[bytes] | None = None
         self.bytes_written = 0
         self._lock = threading.Lock()
@@ -138,6 +161,8 @@ class PcmOutputStream:
                 raise RuntimeError("PCM output stream is not open")
             stdin = self.process.stdin
         try:
+            if self.volume_getter is not None:
+                chunk = scale_pcm16(chunk, self.volume_getter())
             stdin.write(chunk)
             stdin.flush()
         except (BrokenPipeError, OSError):
@@ -190,6 +215,36 @@ class PcmOutputStream:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close(check=exc_type is None)
+
+
+def clamp_volume_level(level: int) -> int:
+    try:
+        clean_level = int(level)
+    except (TypeError, ValueError):
+        clean_level = 10
+    return max(1, min(10, clean_level))
+
+
+def scale_pcm16(chunk: bytes, volume_level: int) -> bytes:
+    clean_level = clamp_volume_level(volume_level)
+    if clean_level >= 10 or not chunk:
+        return chunk
+    even_length = len(chunk) - (len(chunk) % 2)
+    if even_length <= 0:
+        return chunk
+    samples = array("h")
+    samples.frombytes(chunk[:even_length])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    scale = clean_level / 10.0
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * scale)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    scaled = samples.tobytes()
+    if even_length != len(chunk):
+        scaled += chunk[even_length:]
+    return scaled
 
 
 class RawPcmRecorder:
