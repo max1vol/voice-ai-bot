@@ -677,6 +677,13 @@ bool isCloudyCondition(const char *condition)
            strcmp(condition, "Haze") == 0;
 }
 
+bool isMistCondition(const char *condition)
+{
+    return strcmp(condition, "Mist") == 0 ||
+           strcmp(condition, "Fog") == 0 ||
+           strcmp(condition, "Haze") == 0;
+}
+
 bool fetchWeatherForecast()
 {
     lastWeatherFetchNetworkError = false;
@@ -822,21 +829,6 @@ void maintainWeather()
     shutdownRadio("weather");
 }
 
-void weatherDisplayText(char *buffer, size_t size)
-{
-    if (cachedWeather.valid) {
-        const char *summary = "no rain";
-        if (cachedWeather.rainToday) {
-            summary = "rain";
-        } else if (isCloudyCondition(cachedWeather.condition)) {
-            summary = "cloudy";
-        }
-        snprintf(buffer, size, "%dC  %s", cachedWeather.temperatureC, summary);
-        return;
-    }
-    strlcpy(buffer, "Weather syncing", size);
-}
-
 String minuteWords(int minute)
 {
     if (minute == 0) {
@@ -907,6 +899,151 @@ String jsonEscape(const String &input)
     return escaped;
 }
 
+enum class WeatherIconKind : uint8_t {
+    Unknown,
+    Sun,
+    Cloud,
+    Rain,
+    Snow,
+    Thunder,
+    Mist
+};
+
+WeatherIconKind currentWeatherIconKind()
+{
+    if (!cachedWeather.valid) {
+        return WeatherIconKind::Unknown;
+    }
+    if (strcmp(cachedWeather.condition, "Thunderstorm") == 0) {
+        return WeatherIconKind::Thunder;
+    }
+    if (strcmp(cachedWeather.condition, "Snow") == 0) {
+        return WeatherIconKind::Snow;
+    }
+    if (cachedWeather.rainToday || isWetCondition(cachedWeather.condition)) {
+        return WeatherIconKind::Rain;
+    }
+    if (isMistCondition(cachedWeather.condition)) {
+        return WeatherIconKind::Mist;
+    }
+    if (strcmp(cachedWeather.condition, "Clear") == 0) {
+        return WeatherIconKind::Sun;
+    }
+    if (isCloudyCondition(cachedWeather.condition)) {
+        return WeatherIconKind::Cloud;
+    }
+    return WeatherIconKind::Cloud;
+}
+
+int degreeOffsetY(int font)
+{
+    if (font >= 4) {
+        return 12;
+    }
+    if (font >= 2) {
+        return 8;
+    }
+    return 6;
+}
+
+int temperatureLabelWidth(const char *digits, int font)
+{
+    return display->textWidth(digits, font) + display->textWidth("C", font) + 7;
+}
+
+int statusRowFont(const char *dateText, const char *temperatureDigits)
+{
+    constexpr int kStatusRowW = 156;
+    constexpr int kWeatherIconW = 20;
+    constexpr int kWeatherGap = 8;
+    constexpr int kMinMiddleGap = 12;
+    const int fonts[] = {4, 2, 1};
+
+    for (int font : fonts) {
+        const int dateW = display->textWidth(dateText, font);
+        const int weatherW = temperatureLabelWidth(temperatureDigits, font) + kWeatherGap + kWeatherIconW;
+        if (dateW + weatherW + kMinMiddleGap <= kStatusRowW) {
+            return font;
+        }
+    }
+    return 1;
+}
+
+void drawCloudShape(int16_t cx, int16_t cy, uint16_t color)
+{
+    display->fillCircle(cx - 6, cy + 2, 5, color);
+    display->fillCircle(cx, cy - 2, 6, color);
+    display->fillCircle(cx + 7, cy + 3, 4, color);
+    display->fillRoundRect(cx - 11, cy + 2, 22, 8, 3, color);
+}
+
+void drawWeatherIcon(int16_t cx, int16_t cy)
+{
+    const uint16_t sun = dimColor(255, 202, 72);
+    const uint16_t cloud = dimColor(150, 170, 180);
+    const uint16_t rain = dimColor(76, 188, 255);
+    const uint16_t snow = dimColor(220, 250, 255);
+    const uint16_t mist = dimColor(120, 205, 220);
+
+    switch (currentWeatherIconKind()) {
+    case WeatherIconKind::Sun:
+        display->fillCircle(cx, cy, 5, sun);
+        display->drawLine(cx, cy - 10, cx, cy - 8, sun);
+        display->drawLine(cx, cy + 8, cx, cy + 10, sun);
+        display->drawLine(cx - 10, cy, cx - 8, cy, sun);
+        display->drawLine(cx + 8, cy, cx + 10, cy, sun);
+        display->drawLine(cx - 7, cy - 7, cx - 5, cy - 5, sun);
+        display->drawLine(cx + 5, cy + 5, cx + 7, cy + 7, sun);
+        display->drawLine(cx + 7, cy - 7, cx + 5, cy - 5, sun);
+        display->drawLine(cx - 5, cy + 5, cx - 7, cy + 7, sun);
+        break;
+    case WeatherIconKind::Rain:
+        drawCloudShape(cx, cy - 3, cloud);
+        display->drawLine(cx - 7, cy + 8, cx - 9, cy + 12, rain);
+        display->drawLine(cx, cy + 8, cx - 2, cy + 13, rain);
+        display->drawLine(cx + 7, cy + 8, cx + 5, cy + 12, rain);
+        break;
+    case WeatherIconKind::Snow:
+        drawCloudShape(cx, cy - 3, cloud);
+        display->drawLine(cx - 6, cy + 11, cx + 6, cy + 11, snow);
+        display->drawLine(cx, cy + 5, cx, cy + 17, snow);
+        display->drawLine(cx - 5, cy + 6, cx + 5, cy + 16, snow);
+        display->drawLine(cx + 5, cy + 6, cx - 5, cy + 16, snow);
+        break;
+    case WeatherIconKind::Thunder:
+        drawCloudShape(cx, cy - 3, cloud);
+        display->fillTriangle(cx + 1, cy + 5, cx - 4, cy + 15, cx + 2, cy + 12, sun);
+        display->fillTriangle(cx + 2, cy + 9, cx + 8, cy + 9, cx, cy + 18, sun);
+        break;
+    case WeatherIconKind::Mist:
+        display->drawFastHLine(cx - 10, cy - 6, 20, mist);
+        display->drawFastHLine(cx - 7, cy, 17, cloud);
+        display->drawFastHLine(cx - 10, cy + 6, 20, mist);
+        break;
+    case WeatherIconKind::Cloud:
+        drawCloudShape(cx, cy - 1, cloud);
+        break;
+    case WeatherIconKind::Unknown:
+        display->drawCircle(cx, cy, 7, dimColor(110, 125, 130));
+        display->drawFastHLine(cx - 4, cy, 8, dimColor(110, 125, 130));
+        break;
+    }
+}
+
+void drawTemperatureLabel(int16_t rightX, int16_t centerY, const char *digits, int font, uint16_t color)
+{
+    const int digitW = display->textWidth(digits, font);
+    const int labelW = temperatureLabelWidth(digits, font);
+    const int leftX = rightX - labelW;
+    const int degreeX = leftX + digitW + 3;
+
+    display->setTextDatum(ML_DATUM);
+    display->setTextColor(color, TFT_BLACK);
+    display->drawString(digits, leftX, centerY, font);
+    display->drawCircle(degreeX, centerY - degreeOffsetY(font), 2, color);
+    display->drawString("C", degreeX + 5, centerY, font);
+}
+
 void redrawBeforeWake();
 void wakeBacklight(const char *reason);
 
@@ -944,20 +1081,39 @@ void drawWatchFace(const tm &info)
         display->drawString(timeText, 120, 106, 7);
     }
 
-    if (info.tm_yday != lastYearDay) {
-        lastYearDay = info.tm_yday;
-        display->fillRect(54, 173, 132, 18, TFT_BLACK);
-        display->setTextColor(dimColor(255, 202, 112), TFT_BLACK);
-        display->drawString(dateText, 120, 181, 2);
+    char temperatureDigits[8];
+    if (cachedWeather.valid) {
+        snprintf(temperatureDigits, sizeof(temperatureDigits), "%d", cachedWeather.temperatureC);
+    } else {
+        strlcpy(temperatureDigits, "--", sizeof(temperatureDigits));
     }
 
     char statusText[48];
-    weatherDisplayText(statusText, sizeof(statusText));
-    if (strcmp(statusText, lastStatusText) != 0) {
+    snprintf(
+        statusText,
+        sizeof(statusText),
+        "%s|%s|%s|%d",
+        dateText,
+        temperatureDigits,
+        cachedWeather.valid ? cachedWeather.condition : "",
+        cachedWeather.rainToday ? 1 : 0
+    );
+    if (info.tm_yday != lastYearDay || strcmp(statusText, lastStatusText) != 0) {
+        lastYearDay = info.tm_yday;
         strlcpy(lastStatusText, statusText, sizeof(lastStatusText));
-        display->fillRect(43, 195, 154, 13, TFT_BLACK);
-        display->setTextColor(dimColor(132, 220, 232), TFT_BLACK);
-        display->drawString(statusText, 120, 202, 1);
+
+        constexpr int kRowX = 42;
+        constexpr int kRowY = 190;
+        constexpr int kWeatherIconX = 191;
+        constexpr int kTemperatureRight = 175;
+        const int rowFont = statusRowFont(dateText, temperatureDigits);
+
+        display->fillRect(39, 176, 163, 29, TFT_BLACK);
+        display->setTextDatum(ML_DATUM);
+        display->setTextColor(dimColor(255, 202, 112), TFT_BLACK);
+        display->drawString(dateText, kRowX, kRowY, rowFont);
+        drawTemperatureLabel(kTemperatureRight, kRowY, temperatureDigits, rowFont, dimColor(132, 220, 232));
+        drawWeatherIcon(kWeatherIconX, kRowY);
     }
 }
 
