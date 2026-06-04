@@ -171,7 +171,12 @@ class VoiceDaemon:
             LOGGER.info("started scheduled speech task %s: %s", task.id, task.title)
             return True
         if task.action == "background_task":
-            result = self.realtime.tasks.start(task.prompt, title=task.title)
+            result = self.realtime.tasks.start(
+                task.prompt,
+                history=self.conversation.load(),
+                title=task.title,
+                source="scheduled",
+            )
             if not result.get("ok"):
                 LOGGER.warning("failed to start scheduled background task %s: %s", task.id, result)
                 return False
@@ -189,7 +194,8 @@ class VoiceDaemon:
         for task in self.realtime.pending_background_wakeups(limit=1):
             if self.realtime.trigger_background_task_wakeup(self.conversation.load(), task):
                 task_id = str(task.get("id") or "")
-                self.realtime.mark_background_wakeup_reported(task_id)
+                wakeup = task.get("wakeup") if isinstance(task.get("wakeup"), dict) else {}
+                self.realtime.mark_background_wakeup_reported(task_id, str(wakeup.get("message_id") or ""))
                 self._set_led_mode("blink")
                 LOGGER.info("started background wakeup for task %s", task_id)
                 return

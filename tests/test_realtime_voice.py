@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 import wave
 
@@ -18,8 +19,12 @@ from voice_ai_bot.realtime_voice import (
     MEMORY_UPDATE_TOOL_NAME,
     BackgroundTask,
     START_TASK_TOOL_NAME,
+    STEER_TASK_TOOL_NAME,
     SET_VOICE_VOLUME_TOOL_NAME,
+    TASK_STATUS_TOOL_NAME,
     RealtimeConversationSession,
+    BackgroundTaskManager,
+    background_task_prompt,
     conversation_item_for_message,
     event_is_ignorable_control_error,
     extract_response_text,
@@ -38,6 +43,31 @@ class FakeWebSocket:
 
     def send(self, raw):
         self.sent.append(json.loads(raw))
+
+
+class Event:
+    def __init__(self, type, **kwargs):
+        self.type = type
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class Obj:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class FakeResponsesClient:
+    def __init__(self, streams):
+        self.streams = list(streams)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.streams:
+            raise AssertionError("unexpected Responses API call")
+        return self.streams.pop(0)
 
 
 def test_iter_wav_pcm16_chunks_reads_expected_audio(tmp_path):
@@ -128,7 +158,10 @@ def test_realtime_tools_use_async_background_task_interface():
     start_task_tool = next(tool for tool in tools if tool["name"] == START_TASK_TOOL_NAME)
 
     assert START_TASK_TOOL_NAME in tool_names
+    assert STEER_TASK_TOOL_NAME in tool_names
+    assert "query" not in start_task_tool["parameters"]["properties"]
     assert "wakeup_on_complete" in start_task_tool["parameters"]["properties"]
+    assert "wakeup_on_progress" in start_task_tool["parameters"]["properties"]
     assert "list_background_tasks" in tool_names
     assert "get_background_task" in tool_names
     assert "cancel_background_task" in tool_names
@@ -241,7 +274,7 @@ def test_stale_response_events_do_not_pollute_barge_in_turn(tmp_path):
 
 def test_running_background_task_does_not_count_as_live_response(tmp_path):
     session = RealtimeConversationSession(_config(tmp_path))
-    task = BackgroundTask(id="task_123", query="check weather", status="running")
+    task = BackgroundTask(id="task_123", request_text="check weather", status="running")
     session.tasks._tasks[task.id] = task
 
     assert session.tasks.has_running()
@@ -253,7 +286,7 @@ def test_background_task_wakeup_queue_marks_reported(tmp_path):
     session = RealtimeConversationSession(_config(tmp_path))
     task = BackgroundTask(
         id="task_123",
-        query="find something",
+        request_text="find something",
         title="Find something",
         wakeup_on_complete=True,
         status="completed",
@@ -270,12 +303,16 @@ def test_background_task_wakeup_queue_marks_reported(tmp_path):
     assert session.pending_background_wakeups() == []
 
 
-def test_start_task_tool_passes_wakeup_mode(tmp_path):
+def test_start_task_tool_uses_raw_current_transcript_not_tool_query(tmp_path):
     session = RealtimeConversationSession(_config(tmp_path))
     calls = []
 
-    def fake_start(query, title="", wakeup_on_complete=True):
-        calls.append((query, title, wakeup_on_complete))
+    with session._state_lock:
+        session._input_transcript_final = "Please research today's train strikes near Cambridge."
+        session._current_history = [Message(role="user", content="Earlier context")]
+
+    def fake_start(request_text, history=(), title="", wakeup_on_complete=True, wakeup_on_progress=False, source="realtime"):
+        calls.append((request_text, list(history), title, wakeup_on_complete, wakeup_on_progress, source))
         return {"ok": True}
 
     session.tasks.start = fake_start
@@ -284,8 +321,9 @@ def test_start_task_tool_passes_wakeup_mode(tmp_path):
             "name": START_TASK_TOOL_NAME,
             "arguments": json.dumps(
                 {
-                    "query": "research this",
+                    "query": "model-written text that must be ignored",
                     "title": "Research",
+                    "wakeup_on_progress": True,
                     "wakeup_on_complete": False,
                 }
             ),
@@ -293,7 +331,153 @@ def test_start_task_tool_passes_wakeup_mode(tmp_path):
     )
 
     assert output == {"ok": True}
-    assert calls == [("research this", "Research", False)]
+    assert calls == [
+        (
+            "Please research today's train strikes near Cambridge.",
+            [Message(role="user", content="Earlier context")],
+            "Research",
+            False,
+            True,
+            "realtime",
+        )
+    ]
+
+
+def test_steer_task_tool_uses_raw_current_transcript(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    calls = []
+    with session._state_lock:
+        session._input_transcript_final = "By the way, for that task, compare tomorrow too."
+
+    def fake_steer(message, task_id="", wakeup_on_complete=None):
+        calls.append((message, task_id, wakeup_on_complete))
+        return {"ok": True}
+
+    session.tasks.steer = fake_steer
+    output = session._execute_realtime_tool_call(
+        {
+            "name": STEER_TASK_TOOL_NAME,
+            "arguments": json.dumps({"task_id": "task_abc", "wakeup_on_complete": True}),
+        }
+    )
+
+    assert output == {"ok": True}
+    assert calls == [("By the way, for that task, compare tomorrow too.", "task_abc", True)]
+
+
+def test_background_task_prompt_contains_raw_transcript_and_steering(tmp_path):
+    config = _config(tmp_path)
+    task = BackgroundTask(
+        id="task_123",
+        request_text="Can you check today's weather and whether I need an umbrella?",
+        history=[Message(role="user", content="I am in Cambridge today.")],
+        memory_context="User usually walks to work.",
+        steering_messages=[
+            {"created_at": "2026-06-04T08:00:00+00:00", "text": "Also check tomorrow morning."}
+        ],
+    )
+
+    prompt = background_task_prompt(config, task)
+
+    assert "raw user transcript" in prompt
+    assert "Can you check today's weather" in prompt
+    assert "Also check tomorrow morning" in prompt
+    assert "I am in Cambridge today" in prompt
+    assert "User usually walks to work" in prompt
+
+
+def test_background_task_status_tool_then_final_answer(tmp_path):
+    config = _config(tmp_path)
+    manager = BackgroundTaskManager(config)
+    stream1 = [
+        Event("response.created", response=Obj(id="resp_1")),
+        Event(
+            "response.completed",
+            response=Obj(
+                id="resp_1",
+                output=[
+                    Obj(
+                        type="function_call",
+                        name=TASK_STATUS_TOOL_NAME,
+                        call_id="call_1",
+                        arguments=json.dumps({"text": "I am checking the latest sources.", "speak_now": True}),
+                    )
+                ],
+                output_text="",
+            ),
+        ),
+    ]
+    stream2 = [
+        Event("response.created", response=Obj(id="resp_2")),
+        Event("response.output_item.added", item=Obj(type="message", phase="final_answer")),
+        Event("response.output_text.delta", delta="Take an umbrella."),
+        Event("response.completed", response=Obj(id="resp_2", output=[], output_text="Take an umbrella.")),
+    ]
+    fake_responses = FakeResponsesClient([stream1, stream2])
+    manager.client = Obj(responses=fake_responses)
+
+    result = manager.start("Do I need an umbrella today?", history=[Message(role="user", content="Cambridge")])
+    task_id = result["task"]["id"]
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        task = manager.get(task_id)["task"]
+        if task["status"] == "completed":
+            break
+        time.sleep(0.01)
+
+    task = manager.get(task_id)["task"]
+    assert task["status"] == "completed"
+    assert task["result"] == "Take an umbrella."
+    assert task["status_updates"][0]["text"] == "I am checking the latest sources."
+    assert fake_responses.calls[1]["previous_response_id"] == "resp_1"
+    assert fake_responses.calls[1]["input"][0]["type"] == "function_call_output"
+    wakeup = manager.pending_wakeups()[0]
+    assert wakeup["wakeup"]["type"] == "status_update"
+
+
+def test_background_task_steering_restarts_with_latest_message(tmp_path):
+    config = _config(tmp_path)
+    manager = BackgroundTaskManager(config)
+    first_stream_ready = threading.Event()
+    allow_first_stream_to_finish = threading.Event()
+
+    class BlockingStream:
+        def __iter__(self):
+            first_stream_ready.set()
+            allow_first_stream_to_finish.wait(timeout=2)
+            yield Event("response.output_text.delta", delta="stale")
+
+        def close(self):
+            allow_first_stream_to_finish.set()
+
+    final_stream = [
+        Event("response.created", response=Obj(id="resp_final")),
+        Event("response.output_item.added", item=Obj(type="message", phase="final_answer")),
+        Event("response.output_text.delta", delta="Updated answer."),
+        Event("response.completed", response=Obj(id="resp_final", output=[], output_text="Updated answer.")),
+    ]
+    fake_responses = FakeResponsesClient([BlockingStream(), final_stream])
+    manager.client = Obj(responses=fake_responses)
+    result = manager.start("Check weather today.")
+    task_id = result["task"]["id"]
+    assert first_stream_ready.wait(timeout=2)
+
+    steer = manager.steer("Actually include tomorrow.", task_id=task_id)
+    assert steer["ok"]
+    assert allow_first_stream_to_finish.wait(timeout=2)
+
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        task = manager.get(task_id)["task"]
+        if task["status"] == "completed":
+            break
+        time.sleep(0.01)
+
+    task = manager.get(task_id)["task"]
+    assert task["status"] == "completed"
+    assert task["result"] == "Updated answer."
+    assert task["steering_messages"][0]["text"] == "Actually include tomorrow."
+    assert "Actually include tomorrow." in fake_responses.calls[-1]["input"]
 
 
 def test_memory_tools_update_store(tmp_path):

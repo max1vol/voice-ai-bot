@@ -13,8 +13,8 @@ Behavior:
 - Conversation history is persisted as JSON on the Pi.
 - Max Code has a file-backed memory workspace under `/var/lib/voice-ai-bot/agent`. Raw turn notes are written immediately as an audit log, and GPT-5.5 asynchronously consolidates them into compact durable memory entries.
 - Realtime turns include the current local time and user context for Cambridge, UK.
-- The realtime model has background task tools backed by GPT-5.5 with hosted web search, reasoning summaries, and hosted code interpreter for current facts, calculations, code generation, and code checks.
-- Background tasks can wake the realtime model when they finish so the device can speak the result, but unsolicited wakeups obey the same quiet-hours limit.
+- The realtime model has background task tools backed by GPT-5.5 with hosted web search, explicit user-facing status updates, and hosted code interpreter for current facts, calculations, code generation, and code checks.
+- Background tasks can be steered by later push-to-talk turns, and can wake the realtime model for important progress updates or final results, but unsolicited wakeups obey the same quiet-hours limit.
 - The realtime model can create, list, and remove scheduled reminders, alarms, and timed tasks. Scheduled speech is persisted as JSON and will not start during quiet hours: 21:00-07:30 local time.
 - Before calling OpenAI, the daemon waits for DNS and TCP connectivity to `api.openai.com`; this avoids losing the first turn while Wi-Fi is still settling after boot.
 

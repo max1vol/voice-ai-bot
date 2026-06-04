@@ -33,9 +33,11 @@ LOGGER = logging.getLogger(__name__)
 CLOSE_TOOL_NAME = "close_realtime_session"
 WEB_SEARCH_TOOL_NAME = "web_search"
 START_TASK_TOOL_NAME = "start_background_task"
+STEER_TASK_TOOL_NAME = "steer_background_task"
 LIST_TASKS_TOOL_NAME = "list_background_tasks"
 GET_TASK_TOOL_NAME = "get_background_task"
 CANCEL_TASK_TOOL_NAME = "cancel_background_task"
+TASK_STATUS_TOOL_NAME = "emit_status_update"
 ADD_SCHEDULED_TASK_TOOL_NAME = "add_scheduled_task"
 LIST_SCHEDULED_TASKS_TOOL_NAME = "list_scheduled_tasks"
 DELETE_SCHEDULED_TASK_TOOL_NAME = "delete_scheduled_task"
@@ -49,6 +51,7 @@ MEMORY_FORGET_TOOL_NAME = "memory_forget"
 MEMORY_GET_SOURCE_TOOL_NAME = "memory_get_source"
 ASYNC_TASK_TOOL_NAMES = {
     START_TASK_TOOL_NAME,
+    STEER_TASK_TOOL_NAME,
     LIST_TASKS_TOOL_NAME,
     GET_TASK_TOOL_NAME,
     CANCEL_TASK_TOOL_NAME,
@@ -77,10 +80,15 @@ class RealtimeTurnResult:
 @dataclass
 class BackgroundTask:
     id: str
-    query: str
+    request_text: str
+    history: list[Message] = field(default_factory=list)
+    memory_context: str = ""
     title: str = ""
+    source: str = "realtime"
     wakeup_on_complete: bool = False
+    wakeup_on_progress: bool = False
     wakeup_reported: bool = False
+    progress_wakeup_index: int = 0
     status: str = "queued"
     progress: str = "queued"
     response_id: str = ""
@@ -88,10 +96,14 @@ class BackgroundTask:
     reasoning_summary: str = ""
     error: str = ""
     events: list[str] = field(default_factory=list)
+    status_updates: list[dict[str, Any]] = field(default_factory=list)
+    steering_messages: list[dict[str, Any]] = field(default_factory=list)
+    revision: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     completed_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    active_stream: Any = field(default=None, repr=False)
 
 
 def local_context(config: Config) -> str:
@@ -120,9 +132,13 @@ def realtime_session_instructions(config: Config, memory_context: str = "") -> s
         "only when the user explicitly asks to refresh or recheck the weather. Use start_background_task when the "
         "user asks about other current, recent, local, news, opening-hours, price, schedule, or otherwise "
         "time-sensitive facts. Prefer the background task tools for web, code, calculation, or multi-step research "
-        "so the voice session stays interruptible. "
-        "Background GPT-5.5 tasks receive the user's current local time, timezone, and location, and can use "
-        "hosted web search plus code execution. "
+        "so the voice session stays interruptible. Do not rewrite the user's request into a task query; "
+        "start_background_task uses the current user transcript captured by the application. "
+        "If the user says something like 'by the way, for that task', 'actually', 'also ask it', or otherwise "
+        "clarifies or redirects an existing background task, call steer_background_task. Do not summarize or rewrite "
+        "the steering message; the application passes the latest transcript to the task verbatim. "
+        "Background GPT-5.5 tasks receive the raw user transcript, recent conversation, current local time, timezone, "
+        "and location, and can use hosted web search plus code execution. "
         "When start_background_task returns a running task, briefly tell the user it started instead of polling "
         "repeatedly in the same response. Set wakeup_on_complete true when the user expects the final answer "
         "to be spoken automatically after the task finishes; set it false for tasks the user only wants to check later. "
@@ -180,18 +196,21 @@ def realtime_tools() -> list[dict[str, Any]]:
             "description": (
                 "Start an asynchronous GPT-5.5 task for current web research, code generation, code execution, "
                 "calculation, or multi-step analysis. The task runs in the app while the realtime voice session "
-                "continues; use list_background_tasks or get_background_task later to report progress or results."
+                "continues. The application passes the latest user transcript and recent conversation to GPT-5.5; "
+                "do not provide or rewrite the task request yourself."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The full task request, including location, date, or constraints when relevant.",
-                    },
                     "title": {
                         "type": "string",
                         "description": "Optional short human-readable title for the task.",
+                    },
+                    "wakeup_on_progress": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only when the user wants important progress updates spoken automatically."
+                        ),
                     },
                     "wakeup_on_complete": {
                         "type": "boolean",
@@ -201,13 +220,34 @@ def realtime_tools() -> list[dict[str, Any]]:
                         ),
                     },
                 },
-                "required": ["query"],
+            },
+        },
+        {
+            "type": "function",
+            "name": STEER_TASK_TOOL_NAME,
+            "description": (
+                "Send the latest user transcript as a steering message to an existing background GPT-5.5 task. "
+                "Use this when the user clarifies, redirects, narrows, expands, or adds instructions to a task "
+                "that is already running or retained. The application passes the transcript verbatim."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional task id. If omitted, the newest active task is steered.",
+                    },
+                    "wakeup_on_complete": {
+                        "type": "boolean",
+                        "description": "Optionally update whether the final result should be spoken automatically.",
+                    },
+                },
             },
         },
         {
             "type": "function",
             "name": LIST_TASKS_TOOL_NAME,
-            "description": "List background GPT-5.5 tasks, including running status and latest progress summaries.",
+            "description": "List background GPT-5.5 tasks, including running status and user-facing progress updates.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -221,7 +261,7 @@ def realtime_tools() -> list[dict[str, Any]]:
         {
             "type": "function",
             "name": GET_TASK_TOOL_NAME,
-            "description": "Get progress, reasoning-summary text, and final result for a background task.",
+            "description": "Get progress, user-facing status updates, steering messages, and final result for a background task.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -497,23 +537,44 @@ def realtime_tools() -> list[dict[str, Any]]:
 
 
 class BackgroundTaskManager:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, memory: MemoryStore | None = None):
         self.config = config
+        self.memory = memory
         self.client = OpenAI(api_key=config.openai_api_key, timeout=config.task_timeout_seconds)
+        self.tasks_dir = config.memory_dir / "tasks"
         self._tasks: dict[str, BackgroundTask] = {}
         self._lock = threading.RLock()
+        self._load_persisted_tasks()
 
-    def start(self, query: str, title: str = "", wakeup_on_complete: bool = False) -> dict[str, Any]:
-        query = query.strip()
-        if not query:
-            return {"ok": False, "error": "query is required"}
+    def start(
+        self,
+        request_text: str,
+        history: Iterable[Message] = (),
+        title: str = "",
+        wakeup_on_complete: bool = False,
+        wakeup_on_progress: bool = False,
+        source: str = "realtime",
+    ) -> dict[str, Any]:
+        request_text = request_text.strip()
+        if not request_text:
+            return {"ok": False, "error": "current user transcript is required"}
         task_id = f"task_{uuid.uuid4().hex[:10]}"
         clean_title = title.strip()
+        memory_context = ""
+        if self.memory is not None:
+            try:
+                memory_context = self.memory.active_context(request_text)
+            except Exception:
+                LOGGER.exception("failed to collect active memory for background task")
         task = BackgroundTask(
             id=task_id,
-            query=query,
+            request_text=request_text,
+            history=list(history),
+            memory_context=memory_context,
             title=clean_title,
+            source=source,
             wakeup_on_complete=wakeup_on_complete,
+            wakeup_on_progress=wakeup_on_progress,
         )
         if clean_title:
             task.progress = f"queued: {clean_title}"
@@ -522,10 +583,62 @@ class BackgroundTaskManager:
             if len(self._tasks) >= self.config.max_background_tasks:
                 return {"ok": False, "error": "too many retained background tasks; cancel or wait for older tasks"}
             self._tasks[task_id] = task
+            self._persist_task_locked(task)
         thread = threading.Thread(target=self._run_task, args=(task_id,), name=f"task-{task_id}", daemon=True)
         thread.start()
-        LOGGER.info("started background task %s wakeup=%s: %s", task_id, wakeup_on_complete, query)
+        LOGGER.info("started background task %s wakeup=%s: %s", task_id, wakeup_on_complete, request_text)
         return {"ok": True, "task": self._snapshot(task, include_result=False)}
+
+    def steer(
+        self,
+        message: str,
+        task_id: str = "",
+        wakeup_on_complete: bool | None = None,
+    ) -> dict[str, Any]:
+        clean = message.strip()
+        if not clean:
+            return {"ok": False, "error": "current user transcript is required for steering"}
+        should_restart = False
+        stream_to_close = None
+        with self._lock:
+            task = self._get_locked(task_id, prefer_active=True)
+            if task is None:
+                return {"ok": False, "error": f"unknown task id: {task_id or '<latest active>'}"}
+            task.steering_messages.append(
+                {
+                    "id": f"steer_{uuid.uuid4().hex[:10]}",
+                    "text": clean,
+                    "created_at": _iso_time(time.time()),
+                }
+            )
+            task.revision += 1
+            if wakeup_on_complete is not None:
+                task.wakeup_on_complete = wakeup_on_complete
+                task.wakeup_reported = False
+            if task.status not in {"queued", "running", "cancelling"}:
+                task.status = "queued"
+                task.completed_at = None
+                task.error = ""
+                task.result = ""
+                should_restart = True
+            elif task.status == "running":
+                stream_to_close = task.active_stream
+            self._update_locked(task, progress="steering update queued")
+            self._append_event_locked(task, "steering update queued")
+            self._persist_task_locked(task)
+            snapshot = self._snapshot(task, include_result=False)
+        if stream_to_close is not None:
+            close = getattr(stream_to_close, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    LOGGER.exception("failed to close active background stream for steering")
+        if should_restart:
+            thread = threading.Thread(target=self._run_task, args=(task.id,), name=f"task-{task.id}", daemon=True)
+            thread.start()
+        LOGGER.info("steered background task %s with raw user transcript", task.id)
+        return {"ok": True, "task": snapshot}
 
     def list(self, include_completed: bool = False) -> dict[str, Any]:
         with self._lock:
@@ -566,76 +679,204 @@ class BackgroundTaskManager:
 
     def pending_wakeups(self, limit: int = 1) -> list[dict[str, Any]]:
         with self._lock:
-            tasks = [
-                task
-                for task in self._tasks.values()
-                if task.wakeup_on_complete
-                and not task.wakeup_reported
-                and task.status in {"completed", "failed"}
-            ]
-            tasks.sort(key=lambda task: task.completed_at or task.updated_at)
-            return [self._snapshot(task, include_result=True) for task in tasks[:limit]]
+            wakeups: list[dict[str, Any]] = []
+            for task in self._tasks.values():
+                for index, update in enumerate(task.status_updates):
+                    if index < task.progress_wakeup_index:
+                        continue
+                    if not update.get("wakeup") or update.get("reported"):
+                        continue
+                    snapshot = self._snapshot(task, include_result=False)
+                    snapshot["wakeup"] = {
+                        "type": "status_update",
+                        "message_id": update.get("id", ""),
+                        "text": update.get("text", ""),
+                    }
+                    wakeups.append(snapshot)
+                    break
+                if (
+                    task.wakeup_on_complete
+                    and not task.wakeup_reported
+                    and task.status in {"completed", "failed"}
+                ):
+                    snapshot = self._snapshot(task, include_result=True)
+                    snapshot["wakeup"] = {"type": "completed", "message_id": "", "text": task.result or task.error}
+                    wakeups.append(snapshot)
+            wakeups.sort(key=lambda item: item.get("updated_at") or "")
+            return wakeups[:limit]
 
-    def mark_wakeup_reported(self, task_id: str) -> None:
+    def mark_wakeup_reported(self, task_id: str, message_id: str = "") -> None:
         with self._lock:
             task = self._tasks.get(task_id)
             if task is not None:
-                task.wakeup_reported = True
+                if message_id:
+                    for index, update in enumerate(task.status_updates):
+                        if update.get("id") == message_id:
+                            update["reported"] = True
+                            task.progress_wakeup_index = max(task.progress_wakeup_index, index + 1)
+                            break
+                else:
+                    task.wakeup_reported = True
                 task.updated_at = time.time()
+                self._persist_task_locked(task)
 
     def _run_task(self, task_id: str) -> None:
+        while True:
+            restart = self._run_task_revision(task_id)
+            if not restart:
+                return
+
+    def _run_task_revision(self, task_id: str) -> bool:
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
-                return
+                return False
+            active_revision = task.revision
+            if active_revision > 0:
+                task.result = ""
+                task.error = ""
             self._update_locked(task, status="running", progress="starting GPT-5.5 task")
+            self._persist_task_locked(task)
 
-        stream = None
+        stream: Any = None
+        previous_response_id = ""
+        next_input: Any = None
         try:
-            stream = self.client.responses.create(
-                model=self.config.task_model,
-                instructions=background_task_instructions(self.config),
-                input=background_task_prompt(self.config, task.query),
-                reasoning={
-                    "effort": self.config.task_reasoning_effort,
-                    "summary": self.config.task_reasoning_summary,
-                },
-                tools=self._task_tools(),
-                include=self._task_include(),
-                stream=True,
-                store=False,
-                truncation="auto",
-                parallel_tool_calls=True,
-            )
-            for event in stream:
+            while True:
+                stream_state = {"active_phase": "final_answer", "commentary_parts": []}
                 with self._lock:
                     task = self._tasks.get(task_id)
                     if task is None:
-                        return
+                        return False
                     if task.cancel_event.is_set():
-                        close = getattr(stream, "close", None)
-                        if close is not None:
-                            close()
                         self._finish_locked(task, "cancelled", "cancelled")
-                        LOGGER.info("background task %s cancelled", task_id)
-                        return
-                self._handle_stream_event(task_id, event)
+                        self._persist_task_locked(task)
+                        return False
+                    if task.revision != active_revision:
+                        self._update_locked(task, progress="restarting with steering update")
+                        self._persist_task_locked(task)
+                        return True
+                    request_input = next_input or background_task_prompt(self.config, task)
 
-            with self._lock:
-                task = self._tasks.get(task_id)
-                if task is not None and task.status in {"queued", "running", "cancelling"}:
-                    self._finish_locked(task, "completed", "completed")
-                    LOGGER.info("background task %s completed", task_id)
+                kwargs = {
+                    "model": self.config.task_model,
+                    "instructions": background_task_instructions(self.config),
+                    "input": request_input,
+                    "reasoning": {
+                        "effort": self.config.task_reasoning_effort,
+                        "summary": self.config.task_reasoning_summary,
+                    },
+                    "tools": self._task_tools(),
+                    "include": self._task_include(),
+                    "stream": True,
+                    "store": True,
+                    "truncation": "auto",
+                    "parallel_tool_calls": True,
+                }
+                if previous_response_id:
+                    kwargs["previous_response_id"] = previous_response_id
+                stream = self.client.responses.create(**kwargs)
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is not None:
+                        task.active_stream = stream
+                completed_response = None
+                for event in stream:
+                    with self._lock:
+                        task = self._tasks.get(task_id)
+                        if task is None:
+                            return False
+                        if task.cancel_event.is_set():
+                            close = getattr(stream, "close", None)
+                            if close is not None:
+                                close()
+                            if task.active_stream is stream:
+                                task.active_stream = None
+                            self._finish_locked(task, "cancelled", "cancelled")
+                            self._persist_task_locked(task)
+                            LOGGER.info("background task %s cancelled", task_id)
+                            return False
+                        if task.revision != active_revision:
+                            close = getattr(stream, "close", None)
+                            if close is not None:
+                                close()
+                            if task.active_stream is stream:
+                                task.active_stream = None
+                            self._update_locked(task, progress="restarting with steering update")
+                            self._persist_task_locked(task)
+                            return True
+                    response = self._handle_stream_event(task_id, event, stream_state)
+                    if response is not None:
+                        completed_response = response
+
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is not None and task.active_stream is stream:
+                        task.active_stream = None
+                    if task is None:
+                        return False
+                    if task.revision != active_revision:
+                        self._update_locked(task, progress="restarting with steering update")
+                        self._persist_task_locked(task)
+                        return True
+                    self._flush_commentary_locked(task_id, stream_state, wakeup=False)
+                function_outputs = self._function_call_outputs(task_id, completed_response)
+                if function_outputs:
+                    previous_response_id = object_get(completed_response, "id")
+                    next_input = function_outputs
+                    continue
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is not None and task.status in {"queued", "running", "cancelling"}:
+                        self._finish_locked(task, "completed", "completed")
+                        self._persist_task_locked(task)
+                        LOGGER.info("background task %s completed", task_id)
+                return False
         except BaseException as exc:
             with self._lock:
                 task = self._tasks.get(task_id)
                 if task is not None:
+                    if task.active_stream is stream:
+                        task.active_stream = None
+                    if task.revision != active_revision:
+                        self._update_locked(task, progress="restarting with steering update")
+                        self._persist_task_locked(task)
+                        return True
                     task.error = str(exc)
                     self._finish_locked(task, "failed", "failed")
+                    self._persist_task_locked(task)
             LOGGER.exception("background task %s failed", task_id)
+            return False
 
     def _task_tools(self) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = [
+            {
+                "type": "function",
+                "name": TASK_STATUS_TOOL_NAME,
+                "description": (
+                    "Queue a concise user-facing progress update for the realtime voice layer. "
+                    "Use this for meaningful progress or a short preamble, not for private reasoning. "
+                    "Do not use it for the final answer."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "One concise sentence the voice assistant can say to the user.",
+                        },
+                        "speak_now": {
+                            "type": "boolean",
+                            "description": (
+                                "Set true only for important progress that should wake the voice assistant; "
+                                "otherwise it is stored for the user to ask about."
+                            ),
+                        },
+                    },
+                    "required": ["text"],
+                },
+                "strict": True,
+            },
             {
                 "type": "web_search",
                 "search_context_size": self.config.web_search_context_size,
@@ -663,12 +904,12 @@ class BackgroundTaskManager:
             include.append("code_interpreter_call.outputs")
         return include
 
-    def _handle_stream_event(self, task_id: str, event: Any) -> None:
+    def _handle_stream_event(self, task_id: str, event: Any, stream_state: dict[str, Any]) -> Any | None:
         event_type = getattr(event, "type", "")
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or task.status not in {"queued", "running", "cancelling"}:
-                return
+                return None
 
             if event_type == "response.created":
                 response = getattr(event, "response", None)
@@ -698,6 +939,13 @@ class BackgroundTaskManager:
                 code_delta = getattr(event, "delta", "")
                 if code_delta:
                     self._update_locked(task, progress=f"writing code: {_truncate(code_delta.strip(), 160)}")
+            elif event_type in {"response.output_item.added", "response.output_item.created"}:
+                item = getattr(event, "item", None)
+                if object_get(item, "type") == "message":
+                    stream_state["active_phase"] = object_get(item, "phase") or "final_answer"
+                    stream_state["commentary_parts"] = []
+                else:
+                    stream_state["active_phase"] = ""
             elif event_type == "response.reasoning_summary_text.delta":
                 delta = getattr(event, "delta", "")
                 if delta:
@@ -715,26 +963,109 @@ class BackgroundTaskManager:
             elif event_type == "response.output_text.delta":
                 delta = getattr(event, "delta", "")
                 if delta:
-                    task.result = _truncate(task.result + delta, self.config.task_result_chars, keep_tail=True)
-                    self._update_locked(task, progress="writing answer")
+                    if stream_state.get("active_phase") == "commentary":
+                        stream_state.setdefault("commentary_parts", []).append(delta)
+                        self._update_locked(task, progress="writing progress update")
+                    else:
+                        task.result = _truncate(task.result + delta, self.config.task_result_chars, keep_tail=True)
+                        self._update_locked(task, progress="writing answer")
+            elif event_type == "response.output_text.done":
+                if stream_state.get("active_phase") == "commentary":
+                    text = getattr(event, "text", "") or "".join(stream_state.get("commentary_parts", []))
+                    if text:
+                        self._append_status_update_locked(task, text, wakeup=False)
+                    stream_state["commentary_parts"] = []
             elif event_type == "response.completed":
                 response = getattr(event, "response", None)
                 final_text = getattr(response, "output_text", "") or extract_responses_output_text(response)
                 if final_text and not task.result.strip():
                     task.result = _truncate(final_text, self.config.task_result_chars, keep_tail=True)
                 task.response_id = getattr(response, "id", "") or task.response_id
-                self._finish_locked(task, "completed", "completed")
-                LOGGER.info("background task %s completed", task_id)
+                self._persist_task_locked(task)
+                return response
             elif event_type in {"response.failed", "response.incomplete", "error"}:
                 error = getattr(event, "error", None)
                 task.error = str(error or event_type)
                 self._finish_locked(task, "failed", "failed")
+                self._persist_task_locked(task)
+        return None
 
-    def _get_locked(self, task_id: str) -> BackgroundTask | None:
+    def _function_call_outputs(self, task_id: str, response: Any) -> list[dict[str, Any]]:
+        if response is None:
+            return []
+        outputs: list[dict[str, Any]] = []
+        for call in responses_function_calls(response):
+            name = object_get(call, "name")
+            call_id = object_get(call, "call_id")
+            if not call_id:
+                continue
+            if name == TASK_STATUS_TOOL_NAME:
+                arguments = parse_json_object(object_get(call, "arguments") or "{}")
+                text = string_argument(arguments, "text")
+                speak_now = parse_bool_argument(arguments.get("speak_now"), default=False)
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is not None:
+                        self._append_status_update_locked(task, text, wakeup=speak_now or task.wakeup_on_progress)
+                        self._persist_task_locked(task)
+                outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({"ok": True, "queued": bool(text)}, ensure_ascii=False),
+                    }
+                )
+            else:
+                outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({"ok": False, "error": f"unknown background tool: {name}"}),
+                    }
+                )
+        return outputs
+
+    def _flush_commentary_locked(self, task_id: str, stream_state: dict[str, Any], wakeup: bool) -> None:
+        if stream_state.get("active_phase") != "commentary":
+            return
+        text = "".join(stream_state.get("commentary_parts", [])).strip()
+        if not text:
+            return
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        self._append_status_update_locked(task, text, wakeup=wakeup or task.wakeup_on_progress)
+        stream_state["commentary_parts"] = []
+
+    def _append_status_update_locked(self, task: BackgroundTask, text: str, wakeup: bool) -> None:
+        clean = _truncate(text.strip(), 500)
+        if not clean:
+            return
+        task.status_updates.append(
+            {
+                "id": f"status_{uuid.uuid4().hex[:10]}",
+                "text": clean,
+                "created_at": _iso_time(time.time()),
+                "wakeup": bool(wakeup),
+                "reported": False,
+            }
+        )
+        if len(task.status_updates) > 50:
+            del task.status_updates[:-50]
+        self._append_event_locked(task, f"status update: {clean}")
+        self._update_locked(task, progress=clean)
+
+    def _get_locked(self, task_id: str, prefer_active: bool = False) -> BackgroundTask | None:
         if task_id:
             return self._tasks.get(task_id)
         if not self._tasks:
             return None
+        if prefer_active:
+            active = [
+                task for task in self._tasks.values() if task.status in {"queued", "running", "cancelling"}
+            ]
+            if active:
+                return max(active, key=lambda task: task.updated_at)
         return max(self._tasks.values(), key=lambda task: task.created_at)
 
     def _prune_locked(self) -> None:
@@ -749,13 +1080,16 @@ class BackgroundTaskManager:
         while done and len(self._tasks) >= self.config.max_background_tasks:
             task = done.pop(0)
             self._tasks.pop(task.id, None)
+            self._delete_task_file(task.id)
 
     def _snapshot(self, task: BackgroundTask, include_result: bool) -> dict[str, Any]:
         return {
             "id": task.id,
             "title": task.title,
-            "query": task.query,
+            "request_text": task.request_text,
+            "source": task.source,
             "wakeup_on_complete": task.wakeup_on_complete,
+            "wakeup_on_progress": task.wakeup_on_progress,
             "wakeup_reported": task.wakeup_reported,
             "status": task.status,
             "progress": task.progress,
@@ -763,7 +1097,8 @@ class BackgroundTaskManager:
             "updated_at": _iso_time(task.updated_at),
             "completed_at": _iso_time(task.completed_at) if task.completed_at else None,
             "response_id": task.response_id,
-            "reasoning_summary": _truncate(task.reasoning_summary, self.config.task_summary_chars, keep_tail=True),
+            "status_updates": task.status_updates[-12:],
+            "steering_messages": task.steering_messages[-12:],
             "result": task.result if include_result else _truncate(task.result, 1200),
             "error": task.error,
             "events": task.events[-12:],
@@ -775,6 +1110,7 @@ class BackgroundTaskManager:
         if progress is not None:
             task.progress = progress
         task.updated_at = time.time()
+        self._persist_task_locked(task)
 
     def _finish_locked(self, task: BackgroundTask, status: str, progress: str) -> None:
         self._update_locked(task, status=status, progress=progress)
@@ -785,28 +1121,157 @@ class BackgroundTaskManager:
         if len(task.events) > 50:
             del task.events[:-50]
 
+    def _task_file(self, task_id: str) -> Path:
+        return self.tasks_dir / f"{task_id}.json"
+
+    def _persist_task_locked(self, task: BackgroundTask) -> None:
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "task": self._task_payload(task),
+        }
+        path = self._task_file(task.id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+    def _task_payload(self, task: BackgroundTask) -> dict[str, Any]:
+        return {
+            "id": task.id,
+            "request_text": task.request_text,
+            "history": [message.__dict__ for message in task.history],
+            "memory_context": task.memory_context,
+            "title": task.title,
+            "source": task.source,
+            "wakeup_on_complete": task.wakeup_on_complete,
+            "wakeup_on_progress": task.wakeup_on_progress,
+            "wakeup_reported": task.wakeup_reported,
+            "progress_wakeup_index": task.progress_wakeup_index,
+            "status": task.status,
+            "progress": task.progress,
+            "response_id": task.response_id,
+            "result": task.result,
+            "reasoning_summary": task.reasoning_summary,
+            "error": task.error,
+            "events": task.events,
+            "status_updates": task.status_updates,
+            "steering_messages": task.steering_messages,
+            "revision": task.revision,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "completed_at": task.completed_at,
+        }
+
+    def _load_persisted_tasks(self) -> None:
+        if not self.tasks_dir.exists():
+            return
+        for path in sorted(self.tasks_dir.glob("task_*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                data = payload.get("task", payload)
+                task = self._task_from_payload(data)
+            except Exception:
+                LOGGER.exception("failed to load background task state from %s", path)
+                continue
+            self._tasks[task.id] = task
+
+    def _task_from_payload(self, data: dict[str, Any]) -> BackgroundTask:
+        history = []
+        for item in data.get("history", []):
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str):
+                history.append(Message(role=role, content=content))
+        task = BackgroundTask(
+            id=str(data.get("id") or f"task_{uuid.uuid4().hex[:10]}"),
+            request_text=str(data.get("request_text") or data.get("query") or ""),
+            history=history,
+            memory_context=str(data.get("memory_context") or ""),
+            title=str(data.get("title") or ""),
+            source=str(data.get("source") or "realtime"),
+            wakeup_on_complete=bool(data.get("wakeup_on_complete")),
+            wakeup_on_progress=bool(data.get("wakeup_on_progress")),
+            wakeup_reported=bool(data.get("wakeup_reported")),
+            progress_wakeup_index=int(data.get("progress_wakeup_index") or 0),
+            status=str(data.get("status") or "completed"),
+            progress=str(data.get("progress") or ""),
+            response_id=str(data.get("response_id") or ""),
+            result=str(data.get("result") or ""),
+            reasoning_summary=str(data.get("reasoning_summary") or ""),
+            error=str(data.get("error") or ""),
+            events=[str(item) for item in data.get("events", []) if isinstance(item, str)],
+            status_updates=[
+                item for item in data.get("status_updates", []) if isinstance(item, dict)
+            ],
+            steering_messages=[
+                item for item in data.get("steering_messages", []) if isinstance(item, dict)
+            ],
+            revision=int(data.get("revision") or 0),
+            created_at=float(data.get("created_at") or time.time()),
+            updated_at=float(data.get("updated_at") or time.time()),
+            completed_at=data.get("completed_at"),
+        )
+        if task.status in {"queued", "running", "cancelling"}:
+            task.status = "failed"
+            task.progress = "interrupted by daemon restart"
+            task.error = task.error or "interrupted by daemon restart"
+            task.completed_at = time.time()
+        return task
+
+    def _delete_task_file(self, task_id: str) -> None:
+        try:
+            self._task_file(task_id).unlink(missing_ok=True)
+        except Exception:
+            LOGGER.exception("failed to delete task file for %s", task_id)
+
 
 def background_task_instructions(config: Config) -> str:
     return (
-        "You are a background research and code-execution worker for a realtime voice assistant. "
+        "You are a GPT-5.5 background research and code-execution worker for Max Code, a realtime voice assistant. "
+        "The realtime voice model may decide whether to start or steer a task, but it does not interpret or rewrite "
+        "the user's request for you. Interpret the raw user transcript yourself using the provided conversation "
+        "and steering messages. "
         "Use web_search for current, local, or source-dependent facts. Use code_interpreter for calculations, "
         "small programs, data processing, writing code, or checking code. Interpret relative dates like today, "
         "tomorrow, this morning, and tonight using the user's local timezone from the context. For web results, "
         "prefer sources relevant to the user's location and current local date when the query is local or time-sensitive. "
-        "Produce a concise final answer suitable for the voice assistant to summarize aloud, with source names or URLs "
-        "when web facts matter. "
+        "Use emit_status_update for concise user-facing progress updates or preambles. Do not put private reasoning "
+        "or chain-of-thought in status updates. Produce a concise final answer suitable for the voice assistant to "
+        "summarize aloud, with source names or URLs when web facts matter. "
         f"{local_context(config)}"
     )
 
 
-def background_task_prompt(config: Config, query: str) -> str:
+def background_task_prompt(config: Config, task: BackgroundTask) -> str:
+    history = task.history[-12:]
+    history_lines = []
+    for message in history:
+        history_lines.append(f"{message.role}: {_truncate(message.content, 1000)}")
+    steering_lines = []
+    for item in task.steering_messages:
+        text = _truncate(str(item.get("text") or ""), 1000)
+        created_at = str(item.get("created_at") or "")
+        steering_lines.append(f"- {created_at}: {text}")
+    status_lines = []
+    for item in task.status_updates[-8:]:
+        status_lines.append(f"- {item.get('created_at')}: {item.get('text')}")
     return (
         "This task was started from a live push-to-talk Realtime conversation. "
-        "Work independently and stream reasoning summaries so the voice model can report progress. "
+        "Work independently. The text below is the raw user transcript captured by the application, not a rewritten "
+        "query from the realtime model. Correctly infer what the user wants from the raw transcript and context. "
+        "If steering messages are present, treat each steering message as a later raw user utterance about this same "
+        "task. Look up and apply the newest steering message from the user before continuing. "
+        "Use emit_status_update for useful progress messages that Max Code can say to the user. "
         "Use hosted web search for current facts and code_interpreter for calculations, code generation, code execution, "
         "or verification. Treat the following local context as authoritative for 'today', 'now', local weather, events, "
         f"and schedules. {local_context(config)} "
-        f"Task: {query}"
+        f"\n\nOriginal raw user transcript:\n{task.request_text}"
+        f"\n\nRecent conversation before this turn:\n{chr(10).join(history_lines) if history_lines else '[none]'}"
+        f"\n\nRelevant durable memory:\n{task.memory_context.strip() if task.memory_context.strip() else '[none]'}"
+        f"\n\nSteering messages from later user turns:\n{chr(10).join(steering_lines) if steering_lines else '[none]'}"
+        f"\n\nPreviously queued user-facing status updates:\n{chr(10).join(status_lines) if status_lines else '[none]'}"
     )
 
 
@@ -1030,11 +1495,11 @@ class RealtimeConversationSession:
     ):
         self.config = config
         self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
-        self.tasks = BackgroundTaskManager(config)
         self.scheduled_tasks = scheduled_tasks or ScheduledTaskStore(config)
         self.memory = memory or MemoryStore(config)
-        self.weather = OpenWeatherService(config)
         self.memory.ensure_workspace()
+        self.tasks = BackgroundTaskManager(config, self.memory)
+        self.weather = OpenWeatherService(config)
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
@@ -1073,6 +1538,7 @@ class RealtimeConversationSession:
         self._input_transcript_final = ""
         self._output_transcript_parts: list[str] = []
         self._output_transcript_final = ""
+        self._current_history: list[Message] = []
 
     def begin_turn(self, history: Iterable[Message]) -> None:
         self._raise_background_error()
@@ -1082,6 +1548,7 @@ class RealtimeConversationSession:
             self._last_activity_at = time.monotonic()
             self._interrupt_response_locked()
             self._reset_turn_text_locked()
+            self._current_history = list(history)
             self._recorder = RawPcmRecorder(self.config)
             self._capture_queue = queue.Queue()
             self._capture_bytes = 0
@@ -1585,10 +2052,27 @@ class RealtimeConversationSession:
         arguments = parse_tool_arguments(call)
         LOGGER.info("running realtime tool %s with args keys=%s", name, sorted(arguments.keys()))
         if name in {START_TASK_TOOL_NAME, WEB_SEARCH_TOOL_NAME}:
-            query = string_argument(arguments, "query")
             title = string_argument(arguments, "title")
             wakeup_on_complete = parse_bool_argument(arguments.get("wakeup_on_complete"), default=False)
-            return self.tasks.start(query, title=title, wakeup_on_complete=wakeup_on_complete)
+            wakeup_on_progress = parse_bool_argument(arguments.get("wakeup_on_progress"), default=False)
+            return self.tasks.start(
+                self._latest_user_transcript(),
+                history=self._latest_history(),
+                title=title,
+                wakeup_on_complete=wakeup_on_complete,
+                wakeup_on_progress=wakeup_on_progress,
+            )
+        if name == STEER_TASK_TOOL_NAME:
+            wakeup_on_complete = (
+                parse_bool_argument(arguments.get("wakeup_on_complete"), default=False)
+                if "wakeup_on_complete" in arguments
+                else None
+            )
+            return self.tasks.steer(
+                self._latest_user_transcript(),
+                task_id=string_argument(arguments, "task_id"),
+                wakeup_on_complete=wakeup_on_complete,
+            )
         if name == LIST_TASKS_TOOL_NAME:
             return self.tasks.list(
                 include_completed=parse_bool_argument(arguments.get("include_completed"), default=False)
@@ -1657,6 +2141,14 @@ class RealtimeConversationSession:
             )
         return {"ok": False, "error": f"unknown realtime tool: {name}"}
 
+    def _latest_user_transcript(self) -> str:
+        with self._state_lock:
+            return (self._input_transcript_final or "".join(self._input_transcript_parts)).strip()
+
+    def _latest_history(self) -> list[Message]:
+        with self._state_lock:
+            return list(self._current_history)
+
     def trigger_scheduled_speech(self, history: Iterable[Message], title: str, prompt: str) -> bool:
         self._raise_background_error()
         title = title.strip() or "Scheduled task"
@@ -1714,13 +2206,16 @@ class RealtimeConversationSession:
     def pending_background_wakeups(self, limit: int = 1) -> list[dict[str, Any]]:
         return self.tasks.pending_wakeups(limit=limit)
 
-    def mark_background_wakeup_reported(self, task_id: str) -> None:
-        self.tasks.mark_wakeup_reported(task_id)
+    def mark_background_wakeup_reported(self, task_id: str, message_id: str = "") -> None:
+        self.tasks.mark_wakeup_reported(task_id, message_id)
 
     def trigger_background_task_wakeup(self, history: Iterable[Message], task: dict[str, Any]) -> bool:
         self._raise_background_error()
         task_id = str(task.get("id") or "").strip()
         title = str(task.get("title") or task.get("progress") or task_id or "Background task").strip()
+        wakeup = task.get("wakeup") if isinstance(task.get("wakeup"), dict) else {}
+        wakeup_type = str(wakeup.get("type") or "completed")
+        wakeup_text = str(wakeup.get("text") or "")
         if not task_id:
             return False
         with self._state_lock:
@@ -1741,9 +2236,14 @@ class RealtimeConversationSession:
                         {
                             "type": "input_text",
                             "text": (
-                                "A background task has finished and was marked to wake the user. "
-                                "Summarize the result aloud now. Task JSON: "
-                                f"{json.dumps(task, ensure_ascii=False)}"
+                                (
+                                    "A background task sent a progress update for the user. "
+                                    if wakeup_type == "status_update"
+                                    else "A background task has finished and was marked to wake the user. "
+                                )
+                                + "Say the relevant update aloud now. "
+                                + f"Progress update text: {wakeup_text}. Task JSON: "
+                                + f"{json.dumps(task, ensure_ascii=False)}"
                             ),
                         }
                     ],
@@ -1762,7 +2262,7 @@ class RealtimeConversationSession:
                     "output_modalities": ["audio"],
                     "instructions": (
                         f"{local_context(self.config)} "
-                        "A background task finished. Briefly tell the user the result or failure. "
+                        "A background task needs a spoken user update. Briefly tell the user the progress, result, or failure. "
                         "Do not mention internal tool names unless useful."
                     ),
                 },
@@ -1936,13 +2436,35 @@ def response_function_calls(response: dict[str, Any], name: str | None = None) -
     ]
 
 
+def responses_function_calls(response: Any, name: str | None = None) -> list[Any]:
+    if response is None:
+        return []
+    calls = []
+    for item in object_get(response, "output", default=[]) or []:
+        if object_get(item, "type") == "function_call" and (name is None or object_get(item, "name") == name):
+            calls.append(item)
+    return calls
+
+
 def parse_tool_arguments(call: dict[str, Any]) -> dict[str, Any]:
     raw = call.get("arguments") or "{}"
+    return parse_json_object(raw)
+
+
+def parse_json_object(raw: str) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        return {}
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def object_get(obj: Any, name: str, default: Any = "") -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
 def string_argument(arguments: dict[str, Any], name: str, default: str = "") -> str:
