@@ -51,3 +51,18 @@ def test_openweather_requires_api_key(tmp_path):
 
     assert not result["ok"]
     assert "OPENWEATHER_API_KEY" in result["error"]
+
+
+def test_openweather_errors_redact_api_key(tmp_path):
+    def fake_fetch(url: str, timeout: float):
+        raise RuntimeError(f"failed URL {url}")
+
+    config = _config(tmp_path)
+    config = config.__class__(**{**config.__dict__, "openweather_api_key": "ow-secret"})
+    service = OpenWeatherService(config, fetch_json=fake_fetch)
+
+    result = service.get_current_weather(location="Cambridge,GB", no_cache=True)
+
+    assert not result["ok"]
+    assert "ow-secret" not in result["error"]
+    assert "appid=<redacted>" in result["error"]

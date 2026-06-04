@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import ssl
 import threading
 import time
@@ -52,8 +53,9 @@ class OpenWeatherService:
             geo = self._geocode(clean_location)
             weather = self._weather(geo["lat"], geo["lon"], clean_units)
         except Exception as exc:
-            LOGGER.exception("OpenWeather request failed")
-            return {"ok": False, "error": str(exc), "location": clean_location}
+            error = safe_weather_error(exc, self.config.openweather_api_key)
+            LOGGER.warning("OpenWeather request failed: %s", error)
+            return {"ok": False, "error": error, "location": clean_location}
 
         payload = format_weather_payload(
             location_query=clean_location,
@@ -125,6 +127,14 @@ def fetch_json_url(url: str, timeout: float) -> Any:
     with urlopen(request, timeout=timeout, context=context) as response:
         raw = response.read()
     return json.loads(raw.decode("utf-8"))
+
+
+def safe_weather_error(exc: Exception, api_key: str = "") -> str:
+    text = str(exc)
+    if api_key:
+        text = text.replace(api_key, "<redacted>")
+    text = re.sub(r"appid=[^&\\s>'\"]+", "appid=<redacted>", text)
+    return f"{exc.__class__.__name__}: {text}"
 
 
 def format_weather_payload(
