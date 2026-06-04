@@ -27,11 +27,13 @@ constexpr uint32_t kWeatherCacheMs = 10UL * 60UL * 1000UL;
 constexpr uint32_t kWeatherRetryMs = 60UL * 1000UL;
 constexpr uint32_t kDrawerAutoCloseMs = 10000;
 constexpr uint32_t kTouchTapSuppressMs = 600;
+constexpr uint32_t kDoubleTapWindowMs = 700;
 constexpr uint32_t kTripleTapWindowMs = 900;
 constexpr uint32_t kTapMaxDurationMs = 700;
 constexpr uint32_t kHeaderErrorMs = 10000;
 constexpr uint8_t kMinBrightness = 25;
 constexpr int kScreenH = 240;
+constexpr int kTtsTapRegionH = kScreenH / 3;
 constexpr int kDrawerX = 8;
 constexpr int kDrawerW = 224;
 constexpr int kDrawerH = kScreenH - (kDrawerX * 2);
@@ -63,24 +65,19 @@ bool touchWasDown = false;
 bool touchConsumed = false;
 bool ttsRequested = false;
 bool ttsBusy = false;
-bool pendingTouchTts = false;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t lastNtpAttemptMs = 0;
 uint32_t lastSerialStatusMs = 0;
 uint32_t lastBacklightWakeMs = 0;
-uint32_t lastPmuPollMs = 0;
 uint32_t lastWeatherAttemptMs = 0;
 uint32_t suppressTouchTapUntilMs = 0;
 uint32_t suppressVoiceToggleUntilMs = 0;
 uint32_t touchStartMs = 0;
 uint32_t lastTapMs = 0;
-uint32_t pendingTouchTtsAtMs = 0;
 uint32_t headerStatusUntilMs = 0;
-int lastPmuIntPinLevel = -1;
 char lastStatusText[48] = "";
 char headerStatusText[24] = "Max AI Watch";
 char lastHeaderStatusText[24] = "";
-volatile bool powerButtonIrq = false;
 int nextWifiNetworkIndex = 0;
 int activeWifiNetworkIndex = -1;
 int16_t touchStartX = 0;
@@ -102,6 +99,14 @@ bool lastHeaderStatusError = false;
 bool lastWeatherFetchNetworkError = false;
 uint8_t tapCount = 0;
 uint32_t drawerLastInteractionMs = 0;
+
+enum class TapRegion : uint8_t {
+    None,
+    Header,
+    Drawer
+};
+
+TapRegion activeTapRegion = TapRegion::None;
 
 struct WeatherStatus {
     bool valid;
@@ -141,11 +146,6 @@ const char *const kSmallNumbers[] = {
 const char *const kTensNumbers[] = {
     "", "", "twenty", "thirty", "forty", "fifty"
 };
-
-void IRAM_ATTR onPowerButton()
-{
-    powerButtonIrq = true;
-}
 
 uint16_t dimColor(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -999,7 +999,7 @@ void openDrawer()
     if (!backlightOn) {
         wakeBacklight("drawer");
     }
-    pendingTouchTts = false;
+    activeTapRegion = TapRegion::None;
     tapCount = 0;
     drawerOpen = true;
     drawerNeedsRedraw = true;
@@ -1016,7 +1016,7 @@ void closeDrawer()
     }
     drawerOpen = false;
     drawerNeedsRedraw = false;
-    pendingTouchTts = false;
+    activeTapRegion = TapRegion::None;
     tapCount = 0;
     suppressTouchTap();
     Serial.println("[ui] drawer close");
@@ -1075,7 +1075,7 @@ void resetTouchState()
 {
     touchWasDown = false;
     touchConsumed = false;
-    pendingTouchTts = false;
+    activeTapRegion = TapRegion::None;
     tapCount = 0;
     voiceToggleTouchConsumed = false;
 }
@@ -1129,54 +1129,59 @@ void sleepBacklight()
     Serial.println("[display] Backlight off");
 }
 
-void recordTouchTap()
+void resetTapSequence()
+{
+    activeTapRegion = TapRegion::None;
+    tapCount = 0;
+}
+
+TapRegion tapRegionForY(int16_t y)
+{
+    return y < kTtsTapRegionH ? TapRegion::Header : TapRegion::Drawer;
+}
+
+uint32_t tapWindowForRegion(TapRegion region)
+{
+    return region == TapRegion::Header ? kDoubleTapWindowMs : kTripleTapWindowMs;
+}
+
+void recordTouchTap(int16_t y)
 {
     const uint32_t nowMs = millis();
     if (nowMs < suppressTouchTapUntilMs) {
-        pendingTouchTts = false;
-        tapCount = 0;
+        resetTapSequence();
         return;
     }
 
-    if (nowMs - lastTapMs > kTripleTapWindowMs) {
+    const TapRegion region = tapRegionForY(y);
+    if (region != activeTapRegion || nowMs - lastTapMs > tapWindowForRegion(region)) {
         tapCount = 0;
+        activeTapRegion = region;
     }
 
     lastTapMs = nowMs;
     ++tapCount;
-    Serial.printf("[ui] tap count=%u\n", tapCount);
+    Serial.printf(
+        "[ui] %s tap count=%u\n",
+        region == TapRegion::Header ? "header" : "drawer",
+        tapCount
+    );
 
-    if (tapCount >= 3) {
-        Serial.println("[ui] drawer triple tap");
-        pendingTouchTts = false;
-        tapCount = 0;
+    if (region == TapRegion::Header && tapCount >= 2) {
+        Serial.println("[tts] touch header double tap");
+        resetTapSequence();
+        wakeBacklight("touch tts");
+        requestTts("touch double tap");
+        suppressTouchTap(900);
+        return;
+    }
+
+    if (region == TapRegion::Drawer && tapCount >= 3) {
+        Serial.println("[ui] drawer lower triple tap");
+        resetTapSequence();
         openDrawer();
         return;
     }
-
-    pendingTouchTts = tapCount == 1;
-    pendingTouchTtsAtMs = nowMs + kTripleTapWindowMs;
-}
-
-void maintainPendingTouchTts()
-{
-    if (!pendingTouchTts) {
-        return;
-    }
-    if (drawerOpen || ttsBusy) {
-        pendingTouchTts = false;
-        tapCount = 0;
-        return;
-    }
-    if (millis() < pendingTouchTtsAtMs) {
-        return;
-    }
-
-    pendingTouchTts = false;
-    tapCount = 0;
-    Serial.println("[button] touch tap");
-    wakeBacklight("touch");
-    requestTts("touch");
 }
 
 void maintainTouchWake()
@@ -1232,7 +1237,7 @@ void maintainTouchWake()
             dy <= kTapMaxTravel &&
             touchDurationMs <= kTapMaxDurationMs
         ) {
-            recordTouchTap();
+            recordTouchTap((touchStartY + touchLastY) / 2);
         }
         touchConsumed = false;
         voiceToggleTouchConsumed = false;
@@ -1245,64 +1250,9 @@ void maintainTouchWake()
     touchWasDown = touched;
 }
 
-void maintainPowerButtonWake()
-{
-    if (watch->power == nullptr) {
-        return;
-    }
-
-    const uint32_t nowMs = millis();
-    const bool shouldPoll = nowMs - lastPmuPollMs > 250;
-    if (!powerButtonIrq && !shouldPoll) {
-        return;
-    }
-
-    lastPmuPollMs = nowMs;
-    powerButtonIrq = false;
-
-    uint8_t rawIrq[5] = {};
-    for (int i = 0; i < 5; ++i) {
-        rawIrq[i] = watch->power->readRegister(AXP202_INTSTS1 + i);
-    }
-    const int irqPinLevel = digitalRead(AXP202_INT);
-    const bool rawPekEdge = (rawIrq[4] & ((1 << 5) | (1 << 6))) != 0;
-    const bool anyRawIrq = rawIrq[0] || rawIrq[1] || rawIrq[2] || rawIrq[3] || rawIrq[4];
-
-    if (anyRawIrq || irqPinLevel != lastPmuIntPinLevel) {
-        Serial.printf(
-            "[pmu] int=%d irq=%02X %02X %02X %02X %02X\n",
-            irqPinLevel,
-            rawIrq[0],
-            rawIrq[1],
-            rawIrq[2],
-            rawIrq[3],
-            rawIrq[4]
-        );
-        lastPmuIntPinLevel = irqPinLevel;
-    }
-
-    watch->power->readIRQ();
-    const bool shortPress = watch->power->isPEKShortPressIRQ();
-    const bool longPress = watch->power->isPEKLongPressIRQ();
-    if (shortPress || longPress || rawPekEdge) {
-        if (shortPress) {
-            Serial.println("[button] PMU short press");
-        } else if (longPress) {
-            Serial.println("[button] PMU long press");
-        } else {
-            Serial.println("[button] PMU edge press");
-        }
-        wakeBacklight("button");
-        requestTts("button");
-    }
-    watch->power->clearIRQ();
-}
-
 void maintainBacklight()
 {
     maintainTouchWake();
-    maintainPowerButtonWake();
-    maintainPendingTouchTts();
 
     if (backlightOn && millis() - lastBacklightWakeMs > kBacklightTimeoutMs) {
         sleepBacklight();
@@ -1504,22 +1454,6 @@ void setup()
     }
 
     pinMode(TOUCH_INT, INPUT);
-    if (watch->power != nullptr) {
-        watch->powerAttachInterrupt(onPowerButton);
-        watch->power->enableIRQ(
-            AXP202_PEK_SHORTPRESS_IRQ |
-            AXP202_PEK_LONGPRESS_IRQ |
-            AXP202_PEK_FALLING_EDGE_IRQ |
-            AXP202_PEK_RISING_EDGE_IRQ,
-            true
-        );
-        watch->power->clearIRQ();
-        Serial.printf(
-            "[button] AXP PEK IRQ enabled: INTEN3=%02X INTEN5=%02X\n",
-            watch->power->readRegister(AXP202_INTEN3),
-            watch->power->readRegister(AXP202_INTEN5)
-        );
-    }
 
     display = watch->tft;
     display->setRotation(0);
