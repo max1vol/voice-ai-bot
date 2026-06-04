@@ -52,6 +52,8 @@ constexpr int kVoiceToggleY = kDrawerY + 196;
 constexpr int kTapMaxTravel = 48;
 constexpr char kSpeechPath[] = "/speech.mp3";
 constexpr char kHeaderDefaultText[] = "Max AI Watch";
+constexpr char kOpenAiSpeechHost[] = "api.openai.com";
+constexpr char kOpenAiSpeechPath[] = "/v1/audio/speech";
 
 TTGOClass *watch = nullptr;
 TFT_eSPI *display = nullptr;
@@ -1281,13 +1283,26 @@ SpeechDownloadResult downloadSpeechMp3(const String &input)
 
     WiFiClientSecure client;
     client.setInsecure();
+    client.setTimeout(20);
+
+    setHeaderStatus("calling tts...");
+    Serial.println("[tts] connecting to OpenAI");
+    if (!client.connect(kOpenAiSpeechHost, 443, 15000)) {
+        Serial.println("[tts] OpenAI connection failed");
+        speech.close();
+        SPIFFS.remove(kSpeechPath);
+        return SpeechDownloadResult::NetworkError;
+    }
+    Serial.println("[tts] OpenAI connection established");
+    setHeaderStatus("waiting tts...");
 
     HTTPClient http;
     http.setTimeout(20000);
     http.setReuse(false);
-    if (!http.begin(client, "https://api.openai.com/v1/audio/speech")) {
+    if (!http.begin(client, kOpenAiSpeechHost, 443, kOpenAiSpeechPath, true)) {
         Serial.println("[tts] HTTP begin failed");
         speech.close();
+        SPIFFS.remove(kSpeechPath);
         return SpeechDownloadResult::NetworkError;
     }
 
@@ -1415,7 +1430,6 @@ void handleTtsRequest()
     }
 
     const String phrase = spokenTimePhrase(info);
-    setHeaderStatus("calling tts....");
     const SpeechDownloadResult downloadResult = downloadSpeechMp3(phrase);
     if (downloadResult == SpeechDownloadResult::Ok) {
         setHeaderStatus("speaking...");

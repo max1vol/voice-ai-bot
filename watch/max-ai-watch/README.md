@@ -17,7 +17,7 @@ The watchface shows:
 - Tap the top-left `X` button to close the drawer.
 - Use the drawer Voice toggle to disable or re-enable TTS.
 
-During a TTS request, the header replaces `Max AI Watch` with `connecting...`, `weather...`, `calling tts....`, and `speaking...`. Network, weather, and TTS errors are shown in red for 10 seconds or until the next status.
+During a TTS request, the header replaces `Max AI Watch` with `connecting...`, `weather...`, `calling tts...`, `waiting tts...`, and `speaking...`. Network, weather, and TTS errors are shown in red for 10 seconds or until the next status.
 
 ## Hardware
 
