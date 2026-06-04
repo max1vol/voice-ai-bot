@@ -11,6 +11,8 @@
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp32-hal-bt.h>
+#include <esp_sleep.h>
 #include <math.h>
 #include <time.h>
 
@@ -24,7 +26,11 @@ constexpr uint32_t kBacklightTimeoutMs = 12000;
 constexpr uint32_t kWifiIconPollMs = 5000;
 constexpr uint32_t kBatteryPollMs = 15000;
 constexpr uint32_t kWeatherCacheMs = 10UL * 60UL * 1000UL;
+constexpr uint32_t kActiveWeatherRefreshMs = 30UL * 60UL * 1000UL;
+constexpr uint32_t kWeatherRetainMs = 2UL * 60UL * 60UL * 1000UL;
 constexpr uint32_t kWeatherRetryMs = 60UL * 1000UL;
+constexpr uint64_t kIdleMaintenanceWakeSeconds = 6ULL * 60ULL * 60ULL;
+constexpr uint64_t kMicrosPerSecond = 1000000ULL;
 constexpr uint32_t kDrawerAutoCloseMs = 10000;
 constexpr uint32_t kTouchTapSuppressMs = 600;
 constexpr uint32_t kDoubleTapWindowMs = 700;
@@ -68,7 +74,6 @@ bool touchConsumed = false;
 bool ttsRequested = false;
 bool ttsBusy = false;
 uint32_t lastWifiAttemptMs = 0;
-uint32_t lastNtpAttemptMs = 0;
 uint32_t lastSerialStatusMs = 0;
 uint32_t lastBacklightWakeMs = 0;
 uint32_t lastWeatherAttemptMs = 0;
@@ -101,6 +106,7 @@ bool lastHeaderStatusError = false;
 bool lastWeatherFetchNetworkError = false;
 uint8_t tapCount = 0;
 uint32_t drawerLastInteractionMs = 0;
+esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 
 enum class TapRegion : uint8_t {
     None,
@@ -116,9 +122,12 @@ struct WeatherStatus {
     bool rainToday;
     char condition[20];
     uint32_t fetchedMs;
+    time_t fetchedEpoch;
 };
 
-WeatherStatus cachedWeather {false, 0, false, "", 0};
+WeatherStatus cachedWeather {false, 0, false, "", 0, 0};
+RTC_DATA_ATTR WeatherStatus rtcCachedWeather {false, 0, false, "", 0, 0};
+RTC_DATA_ATTR time_t rtcLastNtpSyncEpoch = 0;
 
 struct BatteryStatus {
     int percent;
@@ -289,6 +298,87 @@ BatteryStatus currentBatteryStatus()
     return cachedBatteryStatus;
 }
 
+time_t currentEpoch()
+{
+    const time_t now = time(nullptr);
+    return now > 1700000000 ? now : 0;
+}
+
+bool weatherCacheFresh(uint32_t maxAgeMs)
+{
+    if (!cachedWeather.valid) {
+        return false;
+    }
+
+    const time_t now = currentEpoch();
+    const uint32_t maxAgeSeconds = maxAgeMs / 1000UL;
+    if (now > 0 && cachedWeather.fetchedEpoch > 0) {
+        return now >= cachedWeather.fetchedEpoch &&
+               static_cast<uint32_t>(now - cachedWeather.fetchedEpoch) < maxAgeSeconds;
+    }
+
+    return cachedWeather.fetchedMs > 0 && millis() - cachedWeather.fetchedMs < maxAgeMs;
+}
+
+void persistWeatherCache()
+{
+    rtcCachedWeather = cachedWeather;
+}
+
+void restoreWeatherCache()
+{
+    if (!rtcCachedWeather.valid || rtcCachedWeather.fetchedEpoch == 0) {
+        return;
+    }
+
+    cachedWeather = rtcCachedWeather;
+    cachedWeather.fetchedMs = millis();
+    if (!weatherCacheFresh(kWeatherRetainMs)) {
+        cachedWeather.valid = false;
+        Serial.println("[weather] RTC cache expired");
+        return;
+    }
+
+    Serial.printf(
+        "[weather] restored RTC cache: %dC condition=%s precipitation=%s\n",
+        cachedWeather.temperatureC,
+        cachedWeather.condition,
+        cachedWeather.rainToday ? "yes" : "no"
+    );
+}
+
+bool ntpSyncDue()
+{
+    const time_t now = currentEpoch();
+    if (now == 0 || rtcLastNtpSyncEpoch == 0) {
+        return true;
+    }
+    return static_cast<uint64_t>(now - rtcLastNtpSyncEpoch) >= kIdleMaintenanceWakeSeconds;
+}
+
+bool externalPowerPresent()
+{
+    if (watch == nullptr || watch->power == nullptr) {
+        return false;
+    }
+    return watch->power->isVBUSPlug();
+}
+
+void shutdownRadio(const char *reason)
+{
+    if (WiFi.status() == WL_CONNECTED || WiFi.getMode() != WIFI_OFF) {
+        Serial.print("[power] radio off: ");
+        Serial.println(reason);
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
+    btStop();
+    cachedWifiBars = -1;
+    wifiIconCacheReady = false;
+    lastDrawnWifiBars = -99;
+    activeWifiNetworkIndex = -1;
+}
+
 void drawWifiIcon(int bars)
 {
     const int x = 27;
@@ -413,6 +503,7 @@ bool syncTimeFromNtp()
             syncRtcFromSystem();
             timeSynced = true;
             usedRtcFallback = false;
+            rtcLastNtpSyncEpoch = currentEpoch();
             char stamp[32];
             strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z", &info);
             Serial.print("[time] NTP synced: ");
@@ -425,10 +516,10 @@ bool syncTimeFromNtp()
     return false;
 }
 
-void syncSystemFromRtc()
+bool syncSystemFromRtc()
 {
     if (watch->rtc == nullptr || !watch->rtc->isValid()) {
-        return;
+        return false;
     }
 
     setenv("TZ", kTimezoneLondon, 1);
@@ -436,6 +527,7 @@ void syncSystemFromRtc()
     watch->rtc->syncToSystem();
     usedRtcFallback = true;
     Serial.println("[time] System time loaded from RTC fallback");
+    return true;
 }
 
 void connectWifi()
@@ -449,7 +541,7 @@ void connectWifi()
     }
 
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
+    WiFi.setSleep(true);
     WiFi.disconnect();
 
     activeWifiNetworkIndex = nextWifiNetworkIndex;
@@ -495,7 +587,8 @@ bool connectWifiOrdered(uint32_t perNetworkTimeoutMs)
         }
     }
 
-    Serial.println("[wifi] All configured networks failed; will retry in background");
+    Serial.println("[wifi] All configured networks failed");
+    shutdownRadio("connect failed");
     return false;
 }
 
@@ -505,14 +598,8 @@ void maintainWifiAndTime()
 {
     const uint32_t nowMs = millis();
 
-    if (WiFi.status() != WL_CONNECTED && nowMs - lastWifiAttemptMs > 15000) {
-        WiFi.disconnect();
-        connectWifi();
-    }
-
-    if (!timeSynced && WiFi.status() == WL_CONNECTED && nowMs - lastNtpAttemptMs > 10000) {
-        lastNtpAttemptMs = nowMs;
-        syncTimeFromNtp();
+    if (WiFi.status() == WL_CONNECTED && !ttsBusy) {
+        shutdownRadio("idle");
     }
 
     if (nowMs - lastSerialStatusMs > 60000) {
@@ -647,6 +734,8 @@ bool fetchWeatherForecast()
     cachedWeather.rainToday = rainToday;
     strlcpy(cachedWeather.condition, firstCondition, sizeof(cachedWeather.condition));
     cachedWeather.fetchedMs = millis();
+    cachedWeather.fetchedEpoch = currentEpoch();
+    persistWeatherCache();
 
     Serial.printf(
         "[weather] cached: %dC condition=%s precipitation=%s\n",
@@ -659,7 +748,7 @@ bool fetchWeatherForecast()
 
 bool ensureWeatherForecast()
 {
-    if (cachedWeather.valid && millis() - cachedWeather.fetchedMs < kWeatherCacheMs) {
+    if (weatherCacheFresh(kWeatherCacheMs)) {
         return true;
     }
     return fetchWeatherForecast();
@@ -688,20 +777,24 @@ String weatherSpeechClause()
 
 void maintainWeather()
 {
-    if (WiFi.status() != WL_CONNECTED || ttsBusy) {
+    if (!backlightOn || drawerOpen || ttsBusy) {
         return;
     }
-    if (cachedWeather.valid && millis() - cachedWeather.fetchedMs < kWeatherCacheMs) {
+    if (weatherCacheFresh(kActiveWeatherRefreshMs)) {
         return;
     }
-    if (millis() - lastWeatherAttemptMs < kWeatherRetryMs) {
+    if (lastWeatherAttemptMs > 0 && millis() - lastWeatherAttemptMs < kWeatherRetryMs) {
         return;
     }
 
     lastWeatherAttemptMs = millis();
+    if (!connectWifiOrdered(5000)) {
+        return;
+    }
     if (fetchWeatherForecast()) {
         lastStatusText[0] = '\0';
     }
+    shutdownRadio("weather");
 }
 
 void weatherDisplayText(char *buffer, size_t size)
@@ -1105,6 +1198,25 @@ void redrawBeforeWake()
     }
 }
 
+void enterBatteryDeepSleep(const char *reason)
+{
+    Serial.print("[power] deep sleep: ");
+    Serial.println(reason);
+    shutdownRadio(reason);
+
+    if (watch != nullptr) {
+        watch->closeBL();
+        watch->displaySleep();
+        watch->powerOff();
+    }
+
+    pinMode(TOUCH_INT, INPUT);
+    esp_sleep_enable_ext1_wakeup(GPIO_SEL_38, ESP_EXT1_WAKEUP_ALL_LOW);
+    esp_sleep_enable_timer_wakeup(kIdleMaintenanceWakeSeconds * kMicrosPerSecond);
+    Serial.flush();
+    esp_deep_sleep_start();
+}
+
 void wakeBacklight(const char *reason)
 {
     lastBacklightWakeMs = millis();
@@ -1112,10 +1224,11 @@ void wakeBacklight(const char *reason)
         return;
     }
 
-    redrawBeforeWake();
+    watch->displayWakeup();
     watch->openBL();
     watch->setBrightness(currentBrightness);
     backlightOn = true;
+    redrawBeforeWake();
     Serial.print("[display] Backlight on: ");
     Serial.println(reason);
 }
@@ -1126,9 +1239,15 @@ void sleepBacklight()
         return;
     }
 
+    shutdownRadio("display idle");
     watch->closeBL();
+    watch->displaySleep();
+    watch->powerOff();
     backlightOn = false;
     Serial.println("[display] Backlight off");
+    if (!externalPowerPresent()) {
+        enterBatteryDeepSleep("display idle");
+    }
 }
 
 void resetTapSequence()
@@ -1404,6 +1523,7 @@ void handleTtsRequest()
     setHeaderStatus("connecting...");
     if (WiFi.status() != WL_CONNECTED && !connectWifiOrdered(5000)) {
         setHeaderError("net error");
+        shutdownRadio("tts wifi error");
         ttsBusy = false;
         resetTouchState();
         suppressTouchTap(1200);
@@ -1413,6 +1533,7 @@ void handleTtsRequest()
     setHeaderStatus("weather...");
     if (!ensureWeatherForecast()) {
         setHeaderError(lastWeatherFetchNetworkError ? "net error" : "weather error");
+        shutdownRadio("tts weather error");
         ttsBusy = false;
         resetTouchState();
         suppressTouchTap(1200);
@@ -1423,6 +1544,7 @@ void handleTtsRequest()
     if (!getLocalTimeInfo(info, 250)) {
         Serial.println("[tts] no valid local time");
         setHeaderError("tts error");
+        shutdownRadio("tts time error");
         ttsBusy = false;
         resetTouchState();
         suppressTouchTap(1200);
@@ -1432,6 +1554,7 @@ void handleTtsRequest()
     const String phrase = spokenTimePhrase(info);
     const SpeechDownloadResult downloadResult = downloadSpeechMp3(phrase);
     if (downloadResult == SpeechDownloadResult::Ok) {
+        shutdownRadio("tts downloaded");
         setHeaderStatus("speaking...");
         if (playSpeechMp3()) {
             clearHeaderStatus();
@@ -1439,8 +1562,10 @@ void handleTtsRequest()
             setHeaderError("tts error");
         }
     } else if (downloadResult == SpeechDownloadResult::NetworkError) {
+        shutdownRadio("tts network error");
         setHeaderError("net error");
     } else {
+        shutdownRadio("tts error");
         setHeaderError("tts error");
     }
 
@@ -1457,12 +1582,25 @@ void setup()
     delay(200);
     Serial.println();
     Serial.println("[boot] Max AI Watch");
+    bootWakeCause = esp_sleep_get_wakeup_cause();
+    Serial.print("[boot] Wake cause=");
+    Serial.println(static_cast<int>(bootWakeCause));
 
     watch = TTGOClass::getWatch();
     watch->begin();
-    watch->openBL();
-    watch->setBrightness(currentBrightness);
-    lastBacklightWakeMs = millis();
+    const bool timerMaintenanceWake =
+        bootWakeCause == ESP_SLEEP_WAKEUP_TIMER && !externalPowerPresent();
+    if (timerMaintenanceWake) {
+        backlightOn = false;
+        watch->closeBL();
+        watch->displaySleep();
+    } else {
+        watch->displayWakeup();
+        watch->openBL();
+        watch->setBrightness(currentBrightness);
+        lastBacklightWakeMs = millis();
+    }
+
     if (!SPIFFS.begin(true)) {
         Serial.println("[boot] SPIFFS mount failed");
     }
@@ -1472,15 +1610,32 @@ void setup()
     display = watch->tft;
     display->setRotation(0);
     display->setSwapBytes(true);
-    display->fillScreen(TFT_BLACK);
-    drawStaticFace();
-    Serial.println("[boot] Display initialized");
+    if (!timerMaintenanceWake) {
+        display->fillScreen(TFT_BLACK);
+        drawStaticFace();
+        Serial.println("[boot] Display initialized");
+    } else {
+        Serial.println("[boot] Display kept asleep for timer maintenance");
+    }
 
     setenv("TZ", kTimezoneLondon, 1);
     tzset();
-    syncSystemFromRtc();
-    if (connectWifiOrdered(7000)) {
-        syncTimeFromNtp();
+    const bool rtcLoaded = syncSystemFromRtc();
+    restoreWeatherCache();
+
+    if (timerMaintenanceWake) {
+        if (ntpSyncDue() && connectWifiOrdered(7000)) {
+            syncTimeFromNtp();
+            shutdownRadio("timer ntp");
+        }
+        enterBatteryDeepSleep("timer maintenance complete");
+    }
+
+    if (!rtcLoaded || (bootWakeCause == ESP_SLEEP_WAKEUP_UNDEFINED && ntpSyncDue())) {
+        if (connectWifiOrdered(7000)) {
+            syncTimeFromNtp();
+            shutdownRadio("boot ntp");
+        }
     }
 }
 

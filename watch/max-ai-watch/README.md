@@ -12,12 +12,20 @@ The watchface shows:
 
 ## Controls
 
+- On battery, the watch deep-sleeps when the screen times out. Touch the screen once to wake it, then use the gestures below.
 - Double-tap the top third of the touchscreen, full width around the title/header, to speak the current time and weather.
 - Triple-tap the lower two thirds of the touchscreen, full width, to open the drawer.
 - Tap the top-left `X` button to close the drawer.
 - Use the drawer Voice toggle to disable or re-enable TTS.
 
 During a TTS request, the header replaces `Max AI Watch` with `connecting...`, `weather...`, `calling tts...`, `waiting tts...`, and `speaking...`. Network, weather, and TTS errors are shown in red for 10 seconds or until the next status.
+
+## Battery Policy
+
+- Wi-Fi is off by default and is only enabled for short NTP, weather, or TTS bursts.
+- On battery, screen timeout enters ESP32 deep sleep and wakes on touchscreen interrupt or a 6-hour maintenance timer.
+- The maintenance timer is used for rare NTP sync; weather is refreshed while the screen is on or before TTS, with the last result retained across deep sleep.
+- On USB/external power, the firmware turns off the display, radio, and peripherals at timeout but avoids deep sleep so serial debugging and flashing remain practical.
 
 ## Hardware
 
