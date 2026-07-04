@@ -89,13 +89,16 @@ def test_consolidation_operations_are_applied_as_app_owned_writes(tmp_path):
     assert entries[0]["source"] == "gpt-5-5"
 
 
-def test_bootstrap_context_contains_max_code_identity(tmp_path):
+def test_bootstrap_context_contains_sipquest_identity(tmp_path):
     store = MemoryStore(_config(tmp_path))
 
     context = store.bootstrap_context()
 
-    assert "Max Code" in context
-    assert "do not present yourself as ChatGPT" in context
+    assert "SipQuest" in context
+    assert "do not present yourself as ChatGPT or Max Code" in context
+    assert "CB-38" in context
+    assert "XZ-72" in context
+    assert "secure transaction has been sent to the customer's watch" in context
     assert "Cambridge" in context
 
 

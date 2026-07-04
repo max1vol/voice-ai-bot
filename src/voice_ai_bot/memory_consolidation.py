@@ -18,7 +18,8 @@ LOGGER = logging.getLogger(__name__)
 
 
 CONSOLIDATION_INSTRUCTIONS = (
-    "You are the long-term memory consolidation worker for Max Code, a push-to-talk voice assistant. "
+    "You are the long-term memory consolidation worker for SipQuest, an AI vending assistant for a mystery "
+    "drink machine. "
     "You are smarter and slower than the realtime voice model. Your job is to read raw conversation notes "
     "and propose durable memory operations. Return only a single JSON object. "
     "Keep MEMORY.md compact. Add or update only stable facts, preferences, explicit user instructions, "

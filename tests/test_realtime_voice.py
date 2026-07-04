@@ -38,6 +38,7 @@ from voice_ai_bot.realtime_voice import (
     iter_wav_pcm16_chunks,
     parse_tool_arguments,
     realtime_session_instructions,
+    realtime_turn_instructions,
     realtime_tools,
     response_function_calls,
     response_requested_close,
@@ -193,11 +194,32 @@ def test_realtime_tools_use_async_background_task_interface():
     assert "web_search" not in tool_names
 
 
-def test_realtime_session_instructions_pin_max_code_identity(tmp_path):
+def test_realtime_session_instructions_pin_sipquest_identity(tmp_path):
     instructions = realtime_session_instructions(_config(tmp_path))
 
-    assert "say that you are Max Code" in instructions
-    assert "Do not introduce yourself as ChatGPT" in instructions
+    assert "answer exactly: \"I'm SipQuest, your AI mystery drink vending assistant.\"" in instructions
+    assert "Never say that you are ChatGPT or Max Code" in instructions
+    assert "The customer does not choose an exact drink" in instructions
+    assert "CB-38" in instructions
+    assert "CB38" in instructions
+    assert "Citrus Bloom" in instructions
+    assert "XZ-72" in instructions
+    assert "XZ72" in instructions
+    assert "Azure Zenith" in instructions
+    assert "do not say Jane Street" in instructions
+    assert "The secure transaction has been sent to your watch" in instructions
+
+
+def test_realtime_turn_instructions_pin_sipquest_code_reveals(tmp_path):
+    instructions = realtime_turn_instructions(_config(tmp_path))
+
+    assert "You are SipQuest" in instructions
+    assert "The customer chooses a quest direction, not an exact flavor" in instructions
+    assert "CB-38 or CB38" in instructions
+    assert "XZ-72 or XZ72" in instructions
+    assert "secure transaction has been sent to the user's watch" in instructions
+    assert "Never call it drink number one" in instructions
+    assert "Never call it drink number two" in instructions
 
 
 def test_interrupt_skips_truncate_when_session_is_closed(tmp_path):
