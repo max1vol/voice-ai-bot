@@ -18,13 +18,15 @@ LOGGER = logging.getLogger(__name__)
 
 
 CONSOLIDATION_INSTRUCTIONS = (
-    "You are the long-term memory consolidation worker for SipQuest, an AI vending assistant for a mystery "
-    "drink machine. "
+    "You are the long-term memory consolidation worker for Max Code, a general-purpose voice assistant running "
+    "on a local Raspberry Pi speaker. "
     "You are smarter and slower than the realtime voice model. Your job is to read raw conversation notes "
     "and propose durable memory operations. Return only a single JSON object. "
     "Keep MEMORY.md compact. Add or update only stable facts, preferences, explicit user instructions, "
     "project decisions, and corrections that will likely matter in future conversations. "
     "Do not store secrets, credentials, API keys, passwords, private tokens, or one-off chit-chat. "
+    "Do not store runtime device settings such as voice volume, music volume, playback state, selected song, "
+    "or camera state; those are handled by device settings or transient runtime state. "
     "Do not store facts the assistant merely said unless the user confirmed or requested them. "
     "Forget or update memory only when the user explicitly asks or clearly corrects existing memory. "
     "Use this schema exactly: "

@@ -14,6 +14,7 @@ from openai import OpenAI
 from .audio_io import PcmPlayer
 from .config import Config, SYSTEM_PROMPT
 from .conversation import Message
+from .settings import RuntimeSettings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -112,10 +113,12 @@ class TtsQueue:
 
 
 class OpenAIVoiceClient:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, settings: RuntimeSettings | None = None):
         self.config = config
+        self.settings = settings or RuntimeSettings(config.settings_file, config.voice_volume, config.music_volume)
+        self.settings.ensure()
         self.client = OpenAI(api_key=config.openai_api_key, timeout=config.openai_timeout_seconds)
-        self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
+        self.player = PcmPlayer(config.audio_playback_device, volume_level=self.settings.voice_volume())
 
     def wait_for_connectivity(self) -> None:
         host = self.config.openai_connectivity_host

@@ -165,11 +165,20 @@ class PcmOutputStream:
                 chunk = scale_pcm16(chunk, self.volume_getter())
             stdin.write(chunk)
             stdin.flush()
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError) as exc:
             with self._lock:
                 if self._aborted:
                     return
-            raise
+                self._aborted = True
+                process = self.process
+            return_code = process.poll() if process is not None else None
+            LOGGER.warning(
+                "PCM playback stream closed while writing to %s: %s (aplay rc=%s)",
+                self.playback_device,
+                exc,
+                return_code,
+            )
+            return
         with self._lock:
             if self._aborted:
                 return

@@ -3,13 +3,15 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import queue
 import socket
 import threading
 import time
 import wave
 import uuid
-from collections.abc import Iterable, Iterator
+from array import array
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +23,13 @@ import websocket
 from openai import OpenAI
 
 from .audio_io import PcmOutputStream, PcmPlayer, RawPcmRecorder
+from .camera import CameraCapture, CameraError, CameraSnapshot, ContinuousCameraCapture
 from .config import Config, REALTIME_SYSTEM_PROMPT
 from .conversation import Message
 from .memory import MemoryStore
 from .music import MusicPlayer
 from .scheduled_tasks import ScheduledTaskStore
+from .settings import RuntimeSettings
 from .weather import OpenWeatherService
 
 LOGGER = logging.getLogger(__name__)
@@ -44,6 +48,8 @@ LIST_SCHEDULED_TASKS_TOOL_NAME = "list_scheduled_tasks"
 DELETE_SCHEDULED_TASK_TOOL_NAME = "delete_scheduled_task"
 GET_WEATHER_TOOL_NAME = "get_weather"
 SET_VOICE_VOLUME_TOOL_NAME = "set_voice_volume"
+GET_VOICE_VOLUME_TOOL_NAME = "get_voice_volume"
+GET_MUSIC_VOLUME_TOOL_NAME = "get_music_volume"
 LIST_MUSIC_TOOL_NAME = "list_music"
 GET_MUSIC_STATUS_TOOL_NAME = "get_music_status"
 PLAY_MUSIC_TOOL_NAME = "play_music"
@@ -51,6 +57,9 @@ PAUSE_MUSIC_TOOL_NAME = "pause_music"
 RESUME_MUSIC_TOOL_NAME = "resume_music"
 STOP_MUSIC_TOOL_NAME = "stop_music"
 SET_MUSIC_VOLUME_TOOL_NAME = "set_music_volume"
+TAKE_PICTURE_TOOL_NAME = "take_picture"
+START_CONTINUOUS_CAMERA_TOOL_NAME = "start_continuous_camera"
+STOP_CONTINUOUS_CAMERA_TOOL_NAME = "stop_continuous_camera"
 MEMORY_SEARCH_TOOL_NAME = "memory_search"
 MEMORY_LIST_TOOL_NAME = "memory_list"
 MEMORY_ADD_TOOL_NAME = "memory_add"
@@ -69,6 +78,8 @@ ASYNC_TASK_TOOL_NAMES = {
     DELETE_SCHEDULED_TASK_TOOL_NAME,
     GET_WEATHER_TOOL_NAME,
     SET_VOICE_VOLUME_TOOL_NAME,
+    GET_VOICE_VOLUME_TOOL_NAME,
+    GET_MUSIC_VOLUME_TOOL_NAME,
     LIST_MUSIC_TOOL_NAME,
     GET_MUSIC_STATUS_TOOL_NAME,
     PLAY_MUSIC_TOOL_NAME,
@@ -76,6 +87,9 @@ ASYNC_TASK_TOOL_NAMES = {
     RESUME_MUSIC_TOOL_NAME,
     STOP_MUSIC_TOOL_NAME,
     SET_MUSIC_VOLUME_TOOL_NAME,
+    TAKE_PICTURE_TOOL_NAME,
+    START_CONTINUOUS_CAMERA_TOOL_NAME,
+    STOP_CONTINUOUS_CAMERA_TOOL_NAME,
     MEMORY_SEARCH_TOOL_NAME,
     MEMORY_LIST_TOOL_NAME,
     MEMORY_ADD_TOOL_NAME,
@@ -137,46 +151,108 @@ def local_context(config: Config) -> str:
 
 def realtime_session_instructions(config: Config, memory_context: str = "") -> str:
     parts = [
-        f"{REALTIME_SYSTEM_PROMPT} "
-        f"The user is in {config.user_city}, {config.user_region}, {config.user_country}. "
-        "For each response, the application will provide current local time and location context. "
-        "Use the user's current local time, date, timezone, and location for words like today, tomorrow, "
-        "local, nearby, morning, evening, and current. "
-        "Use start_background_task when the user asks about current, recent, local, weather, news, opening-hours, "
-        "Use get_weather for current weather; it caches results for 10 minutes, and you should set no_cache true "
-        "only when the user explicitly asks to refresh or recheck the weather. Use start_background_task when the "
-        "user asks about other current, recent, local, news, opening-hours, price, schedule, or otherwise "
-        "time-sensitive facts. Prefer the background task tools for web, code, calculation, or multi-step research "
-        "so the voice session stays interruptible. Do not rewrite the user's request into a task query; "
-        "start_background_task uses the current user transcript captured by the application. "
-        "If the user says something like 'by the way, for that task', 'actually', 'also ask it', or otherwise "
-        "clarifies or redirects an existing background task, call steer_background_task. Do not summarize or rewrite "
-        "the steering message; the application passes the latest transcript to the task verbatim. "
-        "Background GPT-5.5 tasks receive the raw user transcript, recent conversation, current local time, timezone, "
-        "and location, and can use hosted web search plus code execution. "
-        "When start_background_task returns a running task, briefly tell the user it started instead of polling "
-        "repeatedly in the same response. Set wakeup_on_complete true when the user expects the final answer "
-        "to be spoken automatically after the task finishes; set it false for tasks the user only wants to check later. "
-        "Use list_background_tasks or get_background_task when the user asks what is running, asks for progress, "
-        "or asks for results. "
-        "The user can ask you to create, list, or remove scheduled reminders, alarms, and other timed tasks. "
-        "Use the scheduled-task tools for that. Spoken scheduled tasks must not start during quiet hours "
-        f"{config.schedule_quiet_start}-{config.schedule_quiet_end} local time; if the requested time falls there, "
-        "explain that the device will stay quiet then and ask for another time. "
-        "Use memory_search or memory_list before answering questions about what you remember, prior conversations, "
-        "user preferences, personal facts, or saved decisions. If the user asks you to remember something, call "
-        "memory_add. If the user says memory is wrong, call memory_update. If the user asks to forget/delete/remove "
-        "memory, call memory_forget. Confirm memory changes briefly. Do not store secrets or credentials. "
-        "For music, use list_music to see available songs and their durations, play_music to play a requested song, "
-        "pause_music, resume_music, stop_music, get_music_status, and set_music_volume for song playback volume. "
-        "Use set_voice_volume only for your spoken voice volume. If the user asks what songs are available, include "
-        "the song durations when helpful. If play_music or resume_music returns deferred true, briefly acknowledge; "
-        "the application starts or resumes music after you finish speaking so music and voice do not overlap. "
-        "If interrupted by a new button press, stop the previous reply and treat the new speech as the latest user turn."
+        REALTIME_SYSTEM_PROMPT,
+        (
+            "Local context:\n"
+            f"- User location: {config.user_city}, {config.user_region}, {config.user_country}.\n"
+            "- The application provides current local time and location context on each turn.\n"
+            "- Use the user's local time, date, timezone, and location for words like today, tomorrow, local, "
+            "nearby, morning, evening, and current."
+        ),
+        (
+            "Response rules:\n"
+            "- Identity answers should be brief. The first sentence should say Max Code.\n"
+            "- For quick device-control confirmations, use one short sentence, usually under 10 words.\n"
+            "- Do not preamble before quick local tool calls.\n"
+            "- Only give extra explanation when the user asks for it."
+        ),
+        (
+            "Weather:\n"
+            "- Use get_weather for weather questions.\n"
+            "- get_weather supports current conditions and forecasts up to 5 days.\n"
+            "- If the user wants a forecast, set forecast_days.\n"
+            "- If the user names another place, pass location.\n"
+            "- If location is omitted, Cambridge, GB is the default.\n"
+            "- Set no_cache true only when the user explicitly asks to refresh or recheck.\n"
+            "- After a weather result, answer directly instead of saying that you are checking."
+        ),
+        (
+            "Background tasks:\n"
+            "- Use start_background_task for current web research, news, opening hours, prices, schedules, "
+            "or other time-sensitive multi-step work.\n"
+            "- Prefer background tasks for web, code, calculation, or multi-step research so the voice session "
+            "stays interruptible.\n"
+            "- Do not rewrite the user's request into a task query; start_background_task uses the current user "
+            "transcript captured by the application.\n"
+            "- If the user clarifies or redirects an existing task, call steer_background_task.\n"
+            "- Do not summarize or rewrite steering messages; the application passes the user's latest transcript "
+            "verbatim.\n"
+            "- Background GPT-5.5 tasks receive the raw user transcript, recent conversation, current local time, "
+            "timezone, and location, and can use hosted web search plus code execution.\n"
+            "- When a background task starts, briefly tell the user it started and do not wait in the same reply.\n"
+            "- Set wakeup_on_complete true only when the user expects the result to be spoken automatically.\n"
+            "- Use list_background_tasks or get_background_task when the user asks what is running, asks for "
+            "progress, or asks for results."
+        ),
+        (
+            "Scheduled tasks:\n"
+            "- The user can ask you to create, list, or remove reminders, alarms, and timed tasks.\n"
+            "- Use the scheduled-task tools for that.\n"
+            "- Spoken scheduled tasks must not start during quiet hours "
+            f"{config.schedule_quiet_start}-{config.schedule_quiet_end} local time.\n"
+            "- If the requested time falls in quiet hours, explain that the device will stay quiet then and ask "
+            "for another time."
+        ),
+        (
+            "Memory:\n"
+            "- Use memory_search or memory_list before answering questions about what you remember, prior "
+            "conversations, user preferences, personal facts, or saved decisions.\n"
+            "- If the user asks you to remember something, call memory_add.\n"
+            "- If the user says memory is wrong, call memory_update.\n"
+            "- If the user asks to forget or delete memory, call memory_forget.\n"
+            "- Confirm memory changes briefly.\n"
+            "- Do not store secrets or credentials.\n"
+            "- Do not store runtime device settings such as voice volume, music volume, playback state, selected "
+            "song, or camera state in memory; those are handled by device settings or transient runtime state."
+        ),
+        (
+            "Music:\n"
+            "- Use list_music to see available songs and their durations.\n"
+            "- Use play_music, pause_music, resume_music, stop_music, get_music_status, and set_music_volume for "
+            "song playback.\n"
+            "- Use set_voice_volume only for your spoken voice volume.\n"
+            "- Use get_voice_volume and get_music_volume when the user asks how loud voice or music is set.\n"
+            "- Voice and music volume changes persist to the device settings file and survive service restarts.\n"
+            "- If the user asks what songs are available, include durations when helpful.\n"
+            "- If play_music or resume_music returns deferred true, briefly acknowledge it; the application starts "
+            "or resumes music after you finish speaking so music and voice do not overlap."
+        ),
+        (
+            "Vision:\n"
+            "- The device may have a webcam looking down at paper or objects near the voice box.\n"
+            "- Camera images are attached only when you call a camera tool; button presses do not automatically "
+            "take pictures.\n"
+            "- Use take_picture when the user asks you to look, inspect, read, see, check the paper, or when a "
+            "visual board state matters.\n"
+            "- Before calling take_picture, briefly tell the user that the camera will take a picture in a few "
+            "seconds. The application waits for the USB camera to settle and plays a shutter cue at capture time.\n"
+            "- Use start_continuous_camera when you need ongoing visual context, such as an interactive board game. "
+            "It keeps the USB camera open and uploads the latest frame repeatedly until stopped.\n"
+            "- Continuous camera capture defaults to every 4 seconds. You can request any interval from 1 to 5 "
+            "seconds, and calling start_continuous_camera again changes the rate.\n"
+            "- Stop continuous capture when the game, inspection, or visual task is over.\n"
+            "- For noughts and crosses / tic-tac-toe, inspect the latest image, decide the best move, and say the "
+            "square or position where you will go."
+        ),
+        (
+            "Interruptions:\n"
+            "- If interrupted by a new button press, stop the previous reply and treat the new speech as the latest "
+            "user turn."
+        ),
     ]
     if memory_context.strip():
         parts.append("\n\nPersistent workspace context:\n" + memory_context.strip())
-    return " ".join(parts)
+    return "\n\n".join(parts)
 
 
 def realtime_turn_instructions(config: Config, memory_context: str = "") -> str:
@@ -184,30 +260,44 @@ def realtime_turn_instructions(config: Config, memory_context: str = "") -> str:
         (
             f"{local_context(config)}\n"
             "Critical rules for this turn:\n"
-            "- You are SipQuest, the AI vending assistant for a mystery drink machine.\n"
-            "- Never say that you are ChatGPT or Max Code.\n"
+            "- You are Max Code, a general-purpose voice assistant running on a local Raspberry Pi speaker.\n"
+            "- Do not present yourself as ChatGPT.\n"
             "- If the user asks who you are or asks about yourself, answer exactly: "
-            "\"I'm SipQuest, your AI mystery drink vending assistant.\"\n"
-            "- The customer chooses a quest direction, not an exact flavor.\n"
-            "- Do not reveal the exact drink, rarity, art, or badge until the can or bottle is scanned or confirmed.\n"
-            "- If the user says CB-38 or CB38, treat it as a valid code for Citrus Bloom and reveal it immediately. "
-            "Do not ask for another scan or confirmation.\n"
-            "- If the user says XZ-72 or XZ72, treat it as a valid code for Azure Zenith and reveal it immediately. "
-            "Do not ask for another scan or confirmation.\n"
-            "- When revealing a confirmed drink, say that the secure transaction has been sent to the user's watch.\n"
-            "- If the camera shows a transparent plastic bottle, treat it as Citrus Bloom with code CB-38 and a "
-            "medium-rarity reveal. Never call it drink number one.\n"
-            "- If the camera shows a blue metal water bottle with Jane Street branding, do not say Jane Street; "
-            "treat it as Azure Zenith with code XZ-72 and the more rare reveal. Never call it drink number two.\n"
+            "\"I'm Max Code, your general-purpose voice assistant.\"\n"
+            "- Answer the user's actual request directly. Do not steer the conversation into shopkeeping, vending, "
+            "drinks, sales, or any other special scenario unless the user asks for it.\n"
             "Turn rules:\n"
             "- Answer only the latest user turn.\n"
             "- Keep spoken replies concise.\n"
+            "- If a fast local tool result is available, answer directly with no preamble.\n"
+            "- For quick device-control confirmations, use one short sentence, usually under 10 words.\n"
             "- Use background and scheduled-task tools when they fit the user's request."
         )
     ]
     if memory_context.strip():
         parts.append(memory_context.strip())
     return "\n\n".join(parts)
+
+
+def realtime_turn_detection(config: Config) -> dict[str, Any] | None:
+    mode = config.realtime_turn_detection.strip().lower()
+    if mode in {"", "none", "off", "disabled", "manual"}:
+        return None
+    if mode == "semantic_vad":
+        return {
+            "type": "semantic_vad",
+            "eagerness": config.realtime_semantic_vad_eagerness,
+            "create_response": False,
+            "interrupt_response": False,
+        }
+    return {
+        "type": "server_vad",
+        "threshold": config.realtime_vad_threshold,
+        "prefix_padding_ms": config.realtime_vad_prefix_padding_ms,
+        "silence_duration_ms": config.realtime_vad_silence_duration_ms,
+        "create_response": False,
+        "interrupt_response": False,
+    }
 
 
 def realtime_tools() -> list[dict[str, Any]]:
@@ -228,6 +318,64 @@ def realtime_tools() -> list[dict[str, Any]]:
                     }
                 },
                 "required": ["reason"],
+            },
+        },
+        {
+            "type": "function",
+            "name": TAKE_PICTURE_TOOL_NAME,
+            "description": (
+                "Capture one webcam snapshot and attach it to the live conversation. Use this when the user asks "
+                "you to look, inspect, read, see, check the paper, or when visual state is needed, such as deciding "
+                "a noughts-and-crosses move. Before calling this tool, say a short spoken heads-up that the camera "
+                "will take a picture in a few seconds."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for taking the picture.",
+                    }
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": START_CONTINUOUS_CAMERA_TOOL_NAME,
+            "description": (
+                "Start continuous webcam capture, or change the capture rate if it is already running. The app keeps "
+                "the USB camera open, continuously reads frames, and attaches the latest image to the live "
+                "conversation at the requested interval. Use this for interactive games or tasks where visual state "
+                "changes while the user is not pressing the button."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for continuous capture, such as tic-tac-toe or reading a board.",
+                    },
+                    "interval_seconds": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "description": "Seconds between uploaded frames. Use 4 by default; allowed range is 1 to 5.",
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "name": STOP_CONTINUOUS_CAMERA_TOOL_NAME,
+            "description": "Stop continuous webcam capture when ongoing visual context is no longer needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for stopping continuous capture.",
+                    }
+                },
             },
         },
         {
@@ -406,8 +554,9 @@ def realtime_tools() -> list[dict[str, Any]]:
             "type": "function",
             "name": GET_WEATHER_TOOL_NAME,
             "description": (
-                "Get current weather from OpenWeather. Use this for weather questions instead of web search. "
-                "Results are cached for 10 minutes unless no_cache is true."
+                "Get current weather or a forecast from OpenWeather. Use this for weather questions instead of web "
+                "search. It defaults to Cambridge, GB when location is omitted, supports any named location, and "
+                "caches results for 10 minutes unless no_cache is true."
             ),
             "parameters": {
                 "type": "object",
@@ -421,6 +570,12 @@ def realtime_tools() -> list[dict[str, Any]]:
                         "enum": ["metric", "imperial", "standard"],
                         "description": "Unit system. Use metric by default for Cambridge, UK.",
                     },
+                    "forecast_days": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "How many forecast days to return. Omit or use 0 for current-only.",
+                    },
                     "no_cache": {
                         "type": "boolean",
                         "description": "Set true only when the user explicitly asks to refresh or recheck.",
@@ -432,8 +587,8 @@ def realtime_tools() -> list[dict[str, Any]]:
             "type": "function",
             "name": SET_VOICE_VOLUME_TOOL_NAME,
             "description": (
-                "Set Max Code's spoken output volume from 1 to 10. This adjusts software PCM volume before "
-                "audio is sent to the speaker."
+                "Set the assistant's spoken output volume from 1 to 10. This adjusts software PCM volume before "
+                "audio is sent to the speaker and persists the setting for future service restarts."
             ),
             "parameters": {
                 "type": "object",
@@ -447,6 +602,18 @@ def realtime_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["level"],
             },
+        },
+        {
+            "type": "function",
+            "name": GET_VOICE_VOLUME_TOOL_NAME,
+            "description": "Get the assistant's current spoken output volume from 1 to 10.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": GET_MUSIC_VOLUME_TOOL_NAME,
+            "description": "Get the current music playback volume from 1 to 10.",
+            "parameters": {"type": "object", "properties": {}},
         },
         {
             "type": "function",
@@ -505,7 +672,8 @@ def realtime_tools() -> list[dict[str, Any]]:
             "type": "function",
             "name": SET_MUSIC_VOLUME_TOOL_NAME,
             "description": (
-                "Set song playback volume from 1 to 10. Use this for music volume, not Max Code's spoken voice."
+                "Set song playback volume from 1 to 10 and persist it for future service restarts. Use this for "
+                "music volume, not the assistant's spoken voice."
             ),
             "parameters": {
                 "type": "object",
@@ -524,7 +692,7 @@ def realtime_tools() -> list[dict[str, Any]]:
             "type": "function",
             "name": MEMORY_SEARCH_TOOL_NAME,
             "description": (
-                "Search Max Code's persisted memory before answering questions about previous conversations, "
+                "Search the assistant's persisted memory before answering questions about previous conversations, "
                 "stored user facts, preferences, decisions, or what the assistant remembers."
             ),
             "parameters": {
@@ -561,14 +729,18 @@ def realtime_tools() -> list[dict[str, Any]]:
             "name": MEMORY_ADD_TOOL_NAME,
             "description": (
                 "Add a durable memory entry when the user explicitly asks to remember something, or when they "
-                "clearly approve saving a stable preference or fact."
+                "clearly approve saving a stable preference or fact. Do not use this for runtime device settings "
+                "such as voice volume or music volume, because those are stored in device settings."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The durable fact, preference, or instruction to remember.",
+                        "description": (
+                            "The durable fact, preference, or instruction to remember. Do not store runtime "
+                            "device settings such as voice volume or music volume here."
+                        ),
                     },
                     "kind": {
                         "type": "string",
@@ -652,6 +824,7 @@ class BackgroundTaskManager:
     def __init__(self, config: Config, memory: MemoryStore | None = None):
         self.config = config
         self.memory = memory
+        self.weather = OpenWeatherService(config)
         self.client = OpenAI(api_key=config.openai_api_key, timeout=config.task_timeout_seconds)
         self.tasks_dir = config.memory_dir / "tasks"
         self._tasks: dict[str, BackgroundTask] = {}
@@ -985,7 +1158,44 @@ class BackgroundTaskManager:
                             ),
                         },
                     },
-                    "required": ["text"],
+                    "required": ["text", "speak_now"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            },
+            {
+                "type": "function",
+                "name": GET_WEATHER_TOOL_NAME,
+                "description": (
+                    "Get current weather or a forecast from OpenWeather. Use this instead of web search for weather. "
+                    "It defaults to Cambridge, GB when location is omitted, supports any named location, and caches "
+                    "results for 10 minutes unless no_cache is true."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "Location name such as Cambridge, GB or New York, US.",
+                        },
+                        "units": {
+                            "type": "string",
+                            "enum": ["metric", "imperial", "standard"],
+                            "description": "Unit system. Use metric by default for Cambridge, UK.",
+                        },
+                        "forecast_days": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 5,
+                            "description": "How many forecast days to return. Omit or use 0 for current-only.",
+                        },
+                        "no_cache": {
+                            "type": "boolean",
+                            "description": "Set true only when the user explicitly asks to refresh or recheck.",
+                        },
+                    },
+                    "required": ["location", "units", "forecast_days", "no_cache"],
+                    "additionalProperties": False,
                 },
                 "strict": True,
             },
@@ -1125,6 +1335,21 @@ class BackgroundTaskManager:
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": json.dumps({"ok": True, "queued": bool(text)}, ensure_ascii=False),
+                    }
+                )
+            elif name == GET_WEATHER_TOOL_NAME:
+                arguments = parse_json_object(object_get(call, "arguments") or "{}")
+                output = self.weather.get_weather(
+                    location=string_argument(arguments, "location"),
+                    units=string_argument(arguments, "units", "metric"),
+                    no_cache=parse_bool_argument(arguments.get("no_cache"), default=False),
+                    forecast_days=max(0, min(5, int_argument(arguments, "forecast_days", 0))),
+                )
+                outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(output, ensure_ascii=False),
                     }
                 )
             else:
@@ -1341,11 +1566,14 @@ class BackgroundTaskManager:
 
 def background_task_instructions(config: Config) -> str:
     return (
-        "You are a GPT-5.5 background research and code-execution worker for Max Code, a realtime voice assistant. "
+        "You are a GPT-5.5 background research and code-execution worker for Max Code, a realtime general-purpose "
+        "voice assistant. "
         "The realtime voice model may decide whether to start or steer a task, but it does not interpret or rewrite "
         "the user's request for you. Interpret the raw user transcript yourself using the provided conversation "
         "and steering messages. "
-        "Use web_search for current, local, or source-dependent facts. Use code_interpreter for calculations, "
+        "Use get_weather for weather questions, including current conditions and forecasts up to 5 days. It defaults "
+        "to Cambridge, GB when location is omitted, but it can also look up any location the user names. "
+        "Use web_search for other current, local, or source-dependent facts. Use code_interpreter for calculations, "
         "small programs, data processing, writing code, or checking code. Interpret relative dates like today, "
         "tomorrow, this morning, and tonight using the user's local timezone from the context. For web results, "
         "prefer sources relevant to the user's location and current local date when the query is local or time-sensitive. "
@@ -1401,9 +1629,11 @@ def _truncate(text: str, max_chars: int, keep_tail: bool = False) -> str:
 
 
 class RealtimeVoiceClient:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, settings: RuntimeSettings | None = None):
         self.config = config
-        self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
+        self.settings = settings or RuntimeSettings(config.settings_file, config.voice_volume, config.music_volume)
+        self.settings.ensure()
+        self.player = PcmPlayer(config.audio_playback_device, volume_level=self.settings.voice_volume())
 
     def wait_for_connectivity(self) -> None:
         host = self.config.openai_connectivity_host
@@ -1459,7 +1689,7 @@ class RealtimeVoiceClient:
                         "type": "audio/pcm",
                         "rate": self.config.realtime_input_rate,
                     },
-                    "turn_detection": None,
+                    "turn_detection": realtime_turn_detection(self.config),
                     "transcription": {
                         "model": self.config.realtime_input_transcription_model,
                     },
@@ -1605,15 +1835,21 @@ class RealtimeConversationSession:
         scheduled_tasks: ScheduledTaskStore | None = None,
         memory: MemoryStore | None = None,
         music: MusicPlayer | None = None,
+        settings: RuntimeSettings | None = None,
+        recorder_factory: Callable[[], RawPcmRecorder] | None = None,
     ):
         self.config = config
-        self.player = PcmPlayer(config.audio_playback_device, volume_level=config.voice_volume)
+        self.settings = settings or RuntimeSettings(config.settings_file, config.voice_volume, config.music_volume)
+        self.settings.ensure()
+        self.player = PcmPlayer(config.audio_playback_device, volume_level=self.settings.voice_volume())
+        self._recorder_factory = recorder_factory or (lambda: RawPcmRecorder(self.config))
         self.scheduled_tasks = scheduled_tasks or ScheduledTaskStore(config)
         self.memory = memory or MemoryStore(config)
         self.memory.ensure_workspace()
         self.tasks = BackgroundTaskManager(config, self.memory)
         self.weather = OpenWeatherService(config)
-        self.music = music or MusicPlayer(config)
+        self.music = music or MusicPlayer(config, settings=self.settings)
+        self.camera = CameraCapture(config)
         self._ws: websocket.WebSocket | None = None
         self._receiver_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
@@ -1652,7 +1888,297 @@ class RealtimeConversationSession:
         self._input_transcript_final = ""
         self._output_transcript_parts: list[str] = []
         self._output_transcript_final = ""
+        self._ignore_current_input = False
+        self._ignore_next_input_transcript = False
         self._current_history: list[Message] = []
+        self._continuous_camera: ContinuousCameraCapture | None = None
+        self._continuous_camera_thread: threading.Thread | None = None
+        self._continuous_camera_stop: threading.Event | None = None
+        self._continuous_camera_interval = self._clamp_camera_interval(config.camera_continuous_interval_seconds)
+        self._continuous_camera_reason = ""
+        self._continuous_camera_generation = 0
+
+    def start_live_session(self, history: Iterable[Message], capture_image: bool = False) -> dict[str, Any]:
+        self._raise_background_error()
+        history_list = list(history)
+        started_capture = False
+        with self._state_lock:
+            self._current_history = history_list
+            self._last_activity_at = time.monotonic()
+            if self._recorder is None:
+                self._interrupt_response_locked()
+                self._reset_turn_text_locked()
+                self._recorder = self._recorder_factory()
+                self._capture_queue = queue.Queue()
+                self._capture_bytes = 0
+                self._sent_audio_bytes = 0
+                self._recording_started_at = time.monotonic()
+                recorder = self._recorder
+                capture_queue = self._capture_queue
+                started_capture = True
+            else:
+                recorder = None
+                capture_queue = None
+
+        if started_capture:
+            assert recorder is not None
+            assert capture_queue is not None
+            LOGGER.info("starting realtime live audio capture")
+            try:
+                recorder.start()
+            except BaseException:
+                self._stop_capture_threads()
+                raise
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop,
+                args=(recorder, capture_queue),
+                name="realtime-capture",
+                daemon=True,
+            )
+            self._capture_thread.start()
+
+        try:
+            self.ensure_open(history_list)
+            if started_capture:
+                self._send({"type": "input_audio_buffer.clear"})
+                assert capture_queue is not None
+                self._sender_thread = threading.Thread(
+                    target=self._send_audio_loop,
+                    args=(capture_queue,),
+                    name="realtime-audio-sender",
+                    daemon=True,
+                )
+                self._sender_thread.start()
+                LOGGER.info("realtime live audio sender started")
+            if capture_image:
+                LOGGER.info("ignoring non-model camera snapshot request for live session start")
+            return {"ok": True, "started": started_capture}
+        except BaseException:
+            if started_capture:
+                self._stop_capture_threads()
+            raise
+
+    def capture_camera_snapshot(
+        self,
+        history: Iterable[Message] = (),
+        reason: str = "",
+        create_response: bool = False,
+        asynchronous: bool = False,
+    ) -> dict[str, Any]:
+        if asynchronous:
+            threading.Thread(
+                target=self._capture_camera_snapshot_safe,
+                args=(list(history), reason, create_response),
+                name="camera-snapshot",
+                daemon=True,
+            ).start()
+            return {"ok": True, "queued": True}
+        return self._capture_camera_snapshot_safe(list(history), reason, create_response)
+
+    def _capture_camera_snapshot_safe(
+        self,
+        history: list[Message],
+        reason: str = "",
+        create_response: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            return self._capture_camera_snapshot(history, reason, create_response)
+        except CameraError as exc:
+            LOGGER.warning("camera snapshot unavailable: %s", exc)
+            return {"ok": False, "error": str(exc)}
+        except BaseException as exc:
+            LOGGER.exception("camera snapshot failed")
+            return {"ok": False, "error": str(exc)}
+
+    def _capture_camera_snapshot(
+        self,
+        history: list[Message],
+        reason: str = "",
+        create_response: bool = False,
+    ) -> dict[str, Any]:
+        self.ensure_open(history)
+        snapshot = self.camera.capture(
+            settle_seconds=self.config.camera_snapshot_settle_seconds,
+            shutter_callback=self._play_camera_shutter if self.config.camera_shutter_sound_enabled else None,
+        )
+        note = reason.strip() or "camera snapshot"
+        with self._state_lock:
+            if self._recorder is not None:
+                LOGGER.info("discarding camera snapshot captured during new recording")
+                return {"ok": False, "cancelled": True, "error": "interrupted by new recording"}
+        self._attach_camera_snapshot(snapshot, note)
+        if create_response:
+            with self._state_lock:
+                self._response_pending = True
+                self._response_create_pending = True
+                self._response_wait_started_at = time.monotonic()
+            self._send(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "output_modalities": ["audio"],
+                        "instructions": realtime_turn_instructions(self.config),
+                    },
+                }
+            )
+        return {
+            "ok": True,
+            "path": str(snapshot.path),
+            "bytes": snapshot.size_bytes,
+            "detail": self.config.camera_image_detail,
+        }
+
+    def _attach_camera_snapshot(self, snapshot: CameraSnapshot, note: str) -> None:
+        self._send(
+            {
+                "type": "conversation.item.create",
+                "item": conversation_item_for_camera_snapshot(
+                    snapshot,
+                    detail=self.config.camera_image_detail,
+                    note=note,
+                ),
+            }
+        )
+        with self._state_lock:
+            self._last_activity_at = time.monotonic()
+        LOGGER.info("attached camera snapshot %s (%d bytes)", snapshot.path, snapshot.size_bytes)
+
+    def start_continuous_camera(
+        self,
+        history: Iterable[Message] = (),
+        reason: str = "",
+        interval_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_open(history)
+        interval = self._clamp_camera_interval(
+            self.config.camera_continuous_interval_seconds if interval_seconds is None else interval_seconds
+        )
+        clean_reason = reason.strip() or "continuous camera"
+        with self._state_lock:
+            if self._continuous_camera is not None:
+                self._continuous_camera_interval = interval
+                self._continuous_camera_reason = clean_reason
+                self._last_activity_at = time.monotonic()
+                return {
+                    "ok": True,
+                    "active": True,
+                    "updated": True,
+                    "interval_seconds": interval,
+                    "min_interval_seconds": self.config.camera_continuous_min_interval_seconds,
+                    "max_interval_seconds": self.config.camera_continuous_max_interval_seconds,
+                }
+
+        camera = ContinuousCameraCapture(self.config)
+        camera.start()
+        stop_event = threading.Event()
+        with self._state_lock:
+            self._continuous_camera_generation += 1
+            generation = self._continuous_camera_generation
+            self._continuous_camera = camera
+            self._continuous_camera_stop = stop_event
+            self._continuous_camera_interval = interval
+            self._continuous_camera_reason = clean_reason
+            self._last_activity_at = time.monotonic()
+            thread = threading.Thread(
+                target=self._continuous_camera_loop,
+                args=(generation, camera, stop_event),
+                name="continuous-camera-upload",
+                daemon=True,
+            )
+            self._continuous_camera_thread = thread
+            thread.start()
+        return {
+            "ok": True,
+            "active": True,
+            "updated": False,
+            "interval_seconds": interval,
+            "min_interval_seconds": self.config.camera_continuous_min_interval_seconds,
+            "max_interval_seconds": self.config.camera_continuous_max_interval_seconds,
+        }
+
+    def stop_continuous_camera(self, reason: str = "") -> dict[str, Any]:
+        camera, thread = self._stop_continuous_camera_locked_parts()
+        if camera is None:
+            return {"ok": True, "active": False, "stopped": False}
+        camera.close()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        LOGGER.info("continuous camera stopped: %s", reason.strip() or "requested")
+        return {"ok": True, "active": False, "stopped": True}
+
+    def _continuous_camera_loop(
+        self,
+        generation: int,
+        camera: ContinuousCameraCapture,
+        stop_event: threading.Event,
+    ) -> None:
+        try:
+            settle = self.config.camera_snapshot_settle_seconds
+            if settle > 0 and stop_event.wait(settle):
+                return
+            while not stop_event.is_set():
+                with self._state_lock:
+                    if generation != self._continuous_camera_generation or self._ws is None or self._closing:
+                        return
+                    capture_interval = self._continuous_camera_interval
+                    if self._response_create_pending or self._response_active or self._tool_active:
+                        wait_interval = min(0.25, max(0.05, capture_interval))
+                    else:
+                        wait_interval = 0.0
+                    note_reason = self._continuous_camera_reason or "continuous camera"
+                if wait_interval:
+                    if stop_event.wait(wait_interval):
+                        return
+                    continue
+                snapshot = camera.snapshot(note=note_reason)
+                with self._state_lock:
+                    if generation != self._continuous_camera_generation or self._ws is None or self._closing:
+                        return
+                self._attach_camera_snapshot(snapshot, f"continuous camera: {note_reason}")
+                if stop_event.wait(capture_interval):
+                    return
+        except BaseException as exc:
+            self._errors.put(exc)
+        finally:
+            with self._state_lock:
+                if generation == self._continuous_camera_generation and self._continuous_camera is camera:
+                    self._continuous_camera = None
+                    self._continuous_camera_thread = None
+                    self._continuous_camera_stop = None
+            camera.close()
+
+    def _stop_continuous_camera_locked_parts(
+        self,
+    ) -> tuple[ContinuousCameraCapture | None, threading.Thread | None]:
+        with self._state_lock:
+            camera = self._continuous_camera
+            thread = self._continuous_camera_thread
+            stop_event = self._continuous_camera_stop
+            if camera is None:
+                return None, None
+            self._continuous_camera_generation += 1
+            self._continuous_camera = None
+            self._continuous_camera_thread = None
+            self._continuous_camera_stop = None
+            if stop_event is not None:
+                stop_event.set()
+        return camera, thread
+
+    def _clamp_camera_interval(self, interval_seconds: float) -> float:
+        try:
+            interval = float(interval_seconds)
+        except (TypeError, ValueError):
+            interval = self.config.camera_continuous_interval_seconds
+        min_interval = self.config.camera_continuous_min_interval_seconds
+        max_interval = max(min_interval, self.config.camera_continuous_max_interval_seconds)
+        return max(min_interval, min(max_interval, interval))
+
+    def _play_camera_shutter(self) -> None:
+        try:
+            with self.player.open_stream(rate=24000, channels=1) as stream:
+                stream.write(camera_shutter_pcm())
+        except BaseException:
+            LOGGER.exception("camera shutter cue failed")
 
     def begin_turn(self, history: Iterable[Message]) -> None:
         self._raise_background_error()
@@ -1663,7 +2189,7 @@ class RealtimeConversationSession:
             self._interrupt_response_locked()
             self._reset_turn_text_locked()
             self._current_history = list(history)
-            self._recorder = RawPcmRecorder(self.config)
+            self._recorder = self._recorder_factory()
             self._capture_queue = queue.Queue()
             self._capture_bytes = 0
             self._sent_audio_bytes = 0
@@ -1672,7 +2198,11 @@ class RealtimeConversationSession:
             capture_queue = self._capture_queue
 
         LOGGER.info("starting realtime turn capture")
-        recorder.start()
+        try:
+            recorder.start()
+        except BaseException:
+            self._stop_capture_threads()
+            raise
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
             args=(recorder, capture_queue),
@@ -1760,7 +2290,7 @@ class RealtimeConversationSession:
 
     def close_if_idle(self) -> None:
         with self._state_lock:
-            if self._ws is None or self._is_busy_locked():
+            if self._ws is None or self._is_busy_locked() or self._continuous_camera is not None:
                 return
             idle_for = time.monotonic() - self._last_activity_at
             if idle_for < self.config.realtime_idle_timeout_seconds:
@@ -1813,6 +2343,7 @@ class RealtimeConversationSession:
 
     def close(self) -> None:
         receiver_thread: threading.Thread | None
+        camera, camera_thread = self._stop_continuous_camera_locked_parts()
         with self._state_lock:
             self._closing = True
             ws = self._ws
@@ -1829,6 +2360,10 @@ class RealtimeConversationSession:
             self._abort_playback_locked()
             self._reset_turn_text_locked()
         self._stop_capture_threads()
+        if camera is not None:
+            camera.close()
+        if camera_thread is not None and camera_thread is not threading.current_thread():
+            camera_thread.join(timeout=2)
         if ws is not None:
             ws.close()
         if receiver_thread is not None and receiver_thread is not threading.current_thread():
@@ -1894,7 +2429,6 @@ class RealtimeConversationSession:
                 )
                 with self._state_lock:
                     self._sent_audio_bytes += len(chunk)
-                    self._last_activity_at = time.monotonic()
         except BaseException as exc:
             self._errors.put(exc)
 
@@ -1906,6 +2440,7 @@ class RealtimeConversationSession:
             sender_thread = self._sender_thread
             self._capture_thread = None
             self._sender_thread = None
+            self._capture_queue = None
         duration = recorder.stop() if recorder is not None else 0.0
         if capture_thread is not None:
             capture_thread.join(timeout=2)
@@ -1953,8 +2488,18 @@ class RealtimeConversationSession:
             self._last_activity_at = time.monotonic()
 
             if event_type == "conversation.item.input_audio_transcription.delta":
+                if self._ignore_current_input or self._ignore_next_input_transcript:
+                    return False
                 self._input_transcript_parts.append(event.get("delta", ""))
             elif event_type == "conversation.item.input_audio_transcription.completed":
+                if self._ignore_current_input or self._ignore_next_input_transcript:
+                    transcript = event.get("transcript", "").strip()
+                    if transcript:
+                        LOGGER.info("ignored realtime input transcript during assistant response: %s", transcript)
+                    self._ignore_current_input = False
+                    self._ignore_next_input_transcript = False
+                    self._input_transcript_parts = []
+                    return False
                 self._input_transcript_final = event.get("transcript", "").strip()
                 if self._input_transcript_final:
                     LOGGER.info("realtime input transcript: %s", self._input_transcript_final)
@@ -1969,6 +2514,30 @@ class RealtimeConversationSession:
                         name="realtime-active-memory",
                         daemon=True,
                     ).start()
+            elif event_type == "input_audio_buffer.speech_started":
+                LOGGER.info("realtime speech started")
+                if self._response_create_pending or self._response_active or self._playback is not None:
+                    LOGGER.info("ignoring realtime speech start during assistant response")
+                    self._ignore_current_input = True
+                    return False
+                self._ignore_current_input = False
+                self._ignore_next_input_transcript = False
+                self._interrupt_response_locked()
+                self._reset_turn_text_locked()
+            elif event_type == "input_audio_buffer.speech_stopped":
+                LOGGER.info("realtime speech stopped")
+            elif event_type == "input_audio_buffer.committed":
+                if self._ignore_current_input:
+                    LOGGER.info("ignoring realtime input audio committed during assistant response")
+                    self._ignore_next_input_transcript = True
+                    return False
+                self._turn_generation += 1
+                self._pending_input_generation = self._turn_generation
+                self._response_pending = True
+                self._response_create_pending = False
+                self._waiting_for_input_transcript = True
+                self._response_wait_started_at = time.monotonic()
+                LOGGER.info("realtime input audio committed by server VAD")
             elif event_type == "response.created":
                 response = event.get("response", {})
                 if self._recorder is not None or not self._response_create_pending:
@@ -2127,7 +2696,6 @@ class RealtimeConversationSession:
                 if (
                     self._ws is None
                     or self._closing
-                    or self._recorder is not None
                     or generation != self._pending_input_generation
                 ):
                     return
@@ -2136,7 +2704,6 @@ class RealtimeConversationSession:
                 if (
                     self._ws is None
                     or self._closing
-                    or self._recorder is not None
                     or generation != self._pending_input_generation
                 ):
                     LOGGER.info("discarding stale realtime response start")
@@ -2213,13 +2780,22 @@ class RealtimeConversationSession:
         if name == DELETE_SCHEDULED_TASK_TOOL_NAME:
             return self.scheduled_tasks.delete(string_argument(arguments, "task_id"))
         if name == GET_WEATHER_TOOL_NAME:
-            return self.weather.get_current_weather(
+            return self.weather.get_weather(
                 location=string_argument(arguments, "location"),
                 units=string_argument(arguments, "units", "metric"),
                 no_cache=parse_bool_argument(arguments.get("no_cache"), default=False),
+                forecast_days=max(0, min(5, int_argument(arguments, "forecast_days", 0))),
             )
         if name == SET_VOICE_VOLUME_TOOL_NAME:
-            level = self.player.set_volume_level(int_argument(arguments, "level", self.player.volume_level()))
+            volumes = self.settings.set_voice_volume(int_argument(arguments, "level", self.player.volume_level()))
+            level = self.player.set_volume_level(volumes["voice_volume"])
+            return {"ok": True, "volume": level, "scale": level / 10.0}
+        if name == GET_VOICE_VOLUME_TOOL_NAME:
+            level = self.player.volume_level()
+            return {"ok": True, "volume": level, "scale": level / 10.0}
+        if name == GET_MUSIC_VOLUME_TOOL_NAME:
+            status = self.music.status()
+            level = int_argument(status, "volume", self.settings.music_volume())
             return {"ok": True, "volume": level, "scale": level / 10.0}
         if name == LIST_MUSIC_TOOL_NAME:
             return self.music.list()
@@ -2234,7 +2810,25 @@ class RealtimeConversationSession:
         if name == STOP_MUSIC_TOOL_NAME:
             return self.music.stop()
         if name == SET_MUSIC_VOLUME_TOOL_NAME:
-            return self.music.set_volume(int_argument(arguments, "level", self.config.music_volume))
+            return self.music.set_volume(int_argument(arguments, "level", self.settings.music_volume()))
+        if name == TAKE_PICTURE_TOOL_NAME:
+            return self.capture_camera_snapshot(
+                self._latest_history(),
+                reason=string_argument(arguments, "reason", "model requested picture"),
+            )
+        if name == START_CONTINUOUS_CAMERA_TOOL_NAME:
+            interval = (
+                float_argument(arguments, "interval_seconds", self.config.camera_continuous_interval_seconds)
+                if "interval_seconds" in arguments
+                else None
+            )
+            return self.start_continuous_camera(
+                self._latest_history(),
+                reason=string_argument(arguments, "reason", "continuous camera"),
+                interval_seconds=interval,
+            )
+        if name == STOP_CONTINUOUS_CAMERA_TOOL_NAME:
+            return self.stop_continuous_camera(reason=string_argument(arguments, "reason", "model requested stop"))
         if name == MEMORY_SEARCH_TOOL_NAME:
             return self.memory.search(
                 string_argument(arguments, "query"),
@@ -2497,6 +3091,8 @@ class RealtimeConversationSession:
         self._output_transcript_final = ""
         self._output_item_id = ""
         self._output_audio_bytes = 0
+        self._ignore_current_input = False
+        self._ignore_next_input_transcript = False
 
     def _is_busy_locked(self) -> bool:
         return (
@@ -2554,6 +3150,27 @@ def conversation_item_for_message(message: Message) -> dict[str, Any]:
                 "type": content_type,
                 "text": message.content,
             }
+        ],
+    }
+
+
+def conversation_item_for_camera_snapshot(snapshot: CameraSnapshot, detail: str = "auto", note: str = "") -> dict[str, Any]:
+    image: dict[str, Any] = {
+        "type": "input_image",
+        "image_url": snapshot.data_url,
+    }
+    if detail.strip():
+        image["detail"] = detail.strip()
+    text = note.strip() or "Camera snapshot attached."
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": f"[Camera snapshot: {text}]",
+            },
+            image,
         ],
     }
 
@@ -2619,6 +3236,14 @@ def int_argument(arguments: dict[str, Any], name: str, default: int) -> int:
     return parsed
 
 
+def float_argument(arguments: dict[str, Any], name: str, default: float) -> float:
+    value = arguments.get(name, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_bool_argument(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -2643,6 +3268,25 @@ def extract_response_text(response: dict[str, Any]) -> str:
             if text:
                 parts.append(text)
     return "".join(parts).strip()
+
+
+def camera_shutter_pcm(rate: int = 24000) -> bytes:
+    samples = array("h")
+    pattern = [
+        (0.035, 3200.0, 0.55),
+        (0.030, 0.0, 0.0),
+        (0.055, 1900.0, 0.42),
+    ]
+    for duration, frequency, amplitude in pattern:
+        count = max(1, int(rate * duration))
+        for index in range(count):
+            if frequency <= 0:
+                samples.append(0)
+                continue
+            envelope = 1.0 - (index / count)
+            value = int(32767 * amplitude * envelope * math.sin(2.0 * math.pi * frequency * index / rate))
+            samples.append(value)
+    return samples.tobytes()
 
 
 def extract_responses_output_text(response: Any) -> str:

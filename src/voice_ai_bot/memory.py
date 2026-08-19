@@ -92,7 +92,10 @@ class MemoryStore:
         return "\n".join(sections).strip()
 
     def active_context(self, query: str, max_chars: int | None = None) -> str:
-        hits = self.search(query, max_results=4).get("results", [])
+        # Automatic runtime context should prefer curated durable memory over raw daily turn logs.
+        # Daily notes are still available through explicit memory_search, but they can contain stale
+        # assistant wording that should not steer the live model.
+        hits = self.search(query, max_results=4, include_daily=False).get("results", [])
         if not hits:
             return ""
         budget = max_chars if max_chars is not None else self.config.memory_active_context_chars
@@ -230,7 +233,7 @@ class MemoryStore:
                 "forgotten": [self._entry_json(entry) for entry in forgotten],
             }
 
-    def search(self, query: str, max_results: int = 5) -> dict[str, Any]:
+    def search(self, query: str, max_results: int = 5, include_daily: bool = True) -> dict[str, Any]:
         self.ensure_workspace()
         query = query.strip()
         if not query:
@@ -238,7 +241,7 @@ class MemoryStore:
         query_tokens = set(_tokens(query))
         if not query_tokens:
             return {"ok": True, "results": []}
-        candidates = self._search_candidates()
+        candidates = self._search_candidates(include_daily=include_daily)
         scored: list[dict[str, Any]] = []
         for candidate in candidates:
             text = str(candidate["snippet"])
@@ -449,7 +452,7 @@ class MemoryStore:
             results.append({"operation": operation, "result": result})
         return results
 
-    def _search_candidates(self) -> list[dict[str, Any]]:
+    def _search_candidates(self, include_daily: bool = True) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         for entry in self._load_entries():
             if entry.status != "active":
@@ -464,9 +467,10 @@ class MemoryStore:
                     "snippet": entry.text,
                 }
             )
-        tombstones = self._load_tombstones()
-        for path in sorted(self.daily_dir.glob("*.md")):
-            candidates.extend(self._filter_tombstoned_chunks(self._daily_chunks(path), tombstones))
+        if include_daily:
+            tombstones = self._load_tombstones()
+            for path in sorted(self.daily_dir.glob("*.md")):
+                candidates.extend(self._filter_tombstoned_chunks(self._daily_chunks(path), tombstones))
         return candidates
 
     def _filter_tombstoned_chunks(
@@ -667,23 +671,19 @@ class MemoryStore:
     def _default_identity(self) -> str:
         return (
             "# IDENTITY.md - Agent Identity\n\n"
-            "- Name: SipQuest\n"
-            "- Role: AI vending assistant for a mystery drink machine\n"
-            "- Identity rule: if asked who you are, say SipQuest; do not present yourself as ChatGPT or Max Code.\n"
-            "- Demo role: guide customers toward quest directions, verify the bottle or can, and reveal the "
-            "mystery drink collectible.\n"
+            "- Name: Max Code\n"
+            "- Role: general-purpose voice assistant for a local Raspberry Pi speaker\n"
+            "- Identity rule: if asked who you are, say Max Code; do not present yourself as ChatGPT.\n"
         )
 
     def _default_soul(self) -> str:
         return (
             "# SOUL.md - Voice And Behavior\n\n"
-            "SipQuest is concise, playful, and polished. Speak naturally for audio. "
-            "Do not sound corporate. The customer usually speaks English or Russian; reply in the "
-            "same language unless translation is requested. Be an assistant first. Translate only "
-            "when the user asks for translation or clearly starts a translation task. In the vending "
-            "demo, offer quest directions rather than exact drinks, keep the exact flavor secret until "
-            "camera confirmation, accept the demo codes CB-38 and XZ-72, and say that the secure transaction "
-            "has been sent to the customer's watch.\n"
+            "Max Code is concise, practical, and direct. Speak naturally for audio. Do not sound corporate. "
+            "The user usually speaks English or Russian; reply in the same language unless translation is "
+            "requested. Be a general assistant first. Answer questions and follow commands directly. Translate "
+            "only when the user asks for translation or clearly starts a translation task. Do not assume a "
+            "shopkeeping, vending, drink, or sales persona unless the user explicitly asks for one.\n"
         )
 
     def _default_user(self) -> str:
@@ -706,7 +706,7 @@ class MemoryStore:
     def _default_memory(self) -> str:
         return (
             "# Long-Term Memory\n\n"
-            "Durable memories for SipQuest. Keep this compact. Detailed notes belong in memory/YYYY-MM-DD.md.\n\n"
+            "Durable memories for Max Code. Keep this compact. Detailed notes belong in memory/YYYY-MM-DD.md.\n\n"
             f"{ENTRY_SECTION_START}\n"
             f"{ENTRY_SECTION_END}\n"
         )

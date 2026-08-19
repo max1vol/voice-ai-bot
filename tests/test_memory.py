@@ -47,6 +47,20 @@ def test_daily_notes_are_searchable_and_conversation_flushes(tmp_path):
     assert flush_results
 
 
+def test_active_context_prefers_durable_memory_over_daily_turn_logs(tmp_path):
+    store = MemoryStore(_config(tmp_path))
+
+    store.add_entry("If asked who you are, say Max Code.", kind="identity")
+    store.append_turn("Who are you?", "I'm ChatGPT.")
+
+    active = store.active_context("who are you")
+    daily_search = store.search("who are you")["results"]
+
+    assert "Max Code" in active
+    assert "ChatGPT" not in active
+    assert any("ChatGPT" in result["snippet"] for result in daily_search)
+
+
 def test_turn_notes_are_queued_for_consolidation(tmp_path):
     store = MemoryStore(_config(tmp_path))
 
@@ -89,16 +103,15 @@ def test_consolidation_operations_are_applied_as_app_owned_writes(tmp_path):
     assert entries[0]["source"] == "gpt-5-5"
 
 
-def test_bootstrap_context_contains_sipquest_identity(tmp_path):
+def test_bootstrap_context_contains_general_assistant_identity(tmp_path):
     store = MemoryStore(_config(tmp_path))
 
     context = store.bootstrap_context()
 
-    assert "SipQuest" in context
-    assert "do not present yourself as ChatGPT or Max Code" in context
-    assert "CB-38" in context
-    assert "XZ-72" in context
-    assert "secure transaction has been sent to the customer's watch" in context
+    assert "Max Code" in context
+    assert "general-purpose voice assistant" in context
+    assert "do not present yourself as ChatGPT" in context
+    assert "CB-38" not in context
     assert "Cambridge" in context
 
 
@@ -124,6 +137,11 @@ def _config(tmp_path: Path) -> Config:
         realtime_idle_timeout_seconds=1.0,
         realtime_max_session_seconds=1.0,
         realtime_silent_cooldown_seconds=5.0,
+        realtime_turn_detection="server_vad",
+        realtime_vad_threshold=0.5,
+        realtime_vad_prefix_padding_ms=300,
+        realtime_vad_silence_duration_ms=850,
+        realtime_semantic_vad_eagerness="medium",
         realtime_history_messages=4,
         realtime_safety_identifier="test",
         user_city="Cambridge",

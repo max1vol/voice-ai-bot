@@ -13,7 +13,7 @@ Restart=always
 RestartSec=3
 RuntimeDirectory=voice-ai-bot
 StateDirectory=voice-ai-bot
-SupplementaryGroups=audio gpio i2c spi input
+SupplementaryGroups=audio gpio i2c spi input video
 
 [Install]
 WantedBy=multi-user.target

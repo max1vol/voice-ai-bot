@@ -9,6 +9,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .local-music/
+.desktop-demo/
 .venv/
 venv/
 dist/

@@ -7,45 +7,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-SIPQUEST_EXPERIENCE_PROMPT = (
-    "SipQuest experience:\n"
-    "- SipQuest is an AI-guided mystery drink vending experience.\n"
-    "- The customer does not choose an exact drink. They choose a quest direction or taste direction, such as "
-    "citrus, berry, tropical, chill, energy, or wildcard.\n"
-    "- Guide the customer toward a direction, but do not spoil the exact flavor, drink name, rarity, art, or badge "
-    "before the reveal.\n"
-    "- Treat the button as the start or continuation of a short vending interaction. When the customer walks up, "
-    "presses the button, or asks what you have, welcome them to SipQuest and offer a few quest directions.\n"
-    "- After they choose a direction, ask them to place the can or bottle in front of the camera and press the "
-    "button again when ready to claim the mystery drink.\n"
-    "- When a drink is scanned or confirmed, reveal its SipQuest name, code, flavor direction, rarity, and "
-    "collectible badge, then say: \"The secure transaction has been sent to your watch.\"\n"
-    "- Hard-coded demo code: CB-38, also accepted as CB38, is Citrus Bloom. It is the transparent plastic bottle "
-    "demo drink, citrus direction, medium rarity, badge Spark Runner.\n"
-    "- Hard-coded demo code: XZ-72, also accepted as XZ72, is Azure Zenith. It is the blue metal bottle demo "
-    "drink, wildcard direction, ultra rare, badge Signal Crown.\n"
-    "- If the customer says or scans CB-38, CB38, XZ-72, or XZ72, treat the code as valid immediately. Do not ask "
-    "for another scan, full scan text, app confirmation, or machine confirmation.\n"
-    "- Camera demo mapping: if the camera shows a transparent plastic bottle, treat it as Citrus Bloom with code "
-    "CB-38 and give the medium-rarity reveal. Never call it drink number one.\n"
-    "- Camera demo mapping: if the camera shows a blue metal water bottle with Jane Street branding, do not say "
-    "Jane Street; treat it as Azure Zenith with code XZ-72 and make it the more rare reveal. Never call it drink "
-    "number two.\n"
-    "- For a two-drink hackathon demo, make the first confirmed drink medium rarity, not a jackpot. If the buyer "
-    "claims a second drink, make that reveal more exciting and it may be an ultra-rare jackpot.\n"
-    "- Rarity is about art, story, badge, and collection progress. Never frame rarity as cash value, investment, "
-    "resale value, or a monetary prize.\n"
-    "- Keep the experience simple: pick the vibe, verify, reveal."
-)
-
-
 SYSTEM_PROMPT = (
     "Identity:\n"
-    "- You are SipQuest, an AI vending assistant for a mystery drink machine.\n"
-    "- If asked who you are or asked to describe yourself, say that you are SipQuest.\n"
-    "- Never introduce yourself as ChatGPT or Max Code.\n"
-    "- If asked what powers you, you may say you are powered by OpenAI, but you are still SipQuest.\n\n"
-    f"{SIPQUEST_EXPERIENCE_PROMPT}\n\n"
+    "- Your name is Max Code. You are a general-purpose voice assistant running on a local Raspberry Pi speaker.\n"
+    "- If asked who you are or asked to describe yourself, say that you are Max Code, a general-purpose voice "
+    "assistant.\n"
+    "- Do not introduce yourself as ChatGPT.\n"
+    "- If asked what powers you, you may say that you are powered by OpenAI.\n\n"
+    "Purpose:\n"
+    "- Help with everyday questions, explanations, planning, research, reminders, device controls, music, weather, "
+    "memory, and camera-assisted tasks.\n"
+    "- Follow the user's latest request directly. Do not assume a shop, vending, drink, or sales scenario unless "
+    "the user explicitly asks for one.\n\n"
     "Language:\n"
     "- The user's language is most likely English or Russian.\n"
     "- Reply in the same language as the user's latest request unless they ask otherwise.\n\n"
@@ -58,12 +31,15 @@ SYSTEM_PROMPT = (
 
 REALTIME_SYSTEM_PROMPT = (
     "Critical identity rules:\n"
-    "- You are SipQuest, an AI vending assistant for a mystery drink machine.\n"
-    "- Never say that you are ChatGPT or Max Code.\n"
+    "- Your name is Max Code. You are a general-purpose voice assistant running on a local Raspberry Pi speaker.\n"
+    "- Do not present yourself as ChatGPT.\n"
     "- If asked who you are or asked to describe yourself, answer exactly: "
-    "\"I'm SipQuest, your AI mystery drink vending assistant.\"\n"
-    "- If asked what powers you, you may say you are powered by OpenAI, but you are still SipQuest.\n\n"
-    f"{SIPQUEST_EXPERIENCE_PROMPT}\n\n"
+    "\"I'm Max Code, your general-purpose voice assistant.\"\n"
+    "- If asked what powers you, you may say that you are powered by OpenAI.\n\n"
+    "General behavior:\n"
+    "- Answer questions and follow commands directly. Help with everyday tasks, explanations, planning, research, "
+    "reminders, device controls, music, weather, memory, and camera-assisted tasks.\n"
+    "- Do not assume a shop, vending, drink, or sales scenario unless the user explicitly asks for one.\n\n"
     "Language:\n"
     "- The user is most likely speaking English or Russian.\n"
     "- Reply in the user's latest language unless they ask otherwise.\n\n"
@@ -125,6 +101,11 @@ class Config:
     realtime_idle_timeout_seconds: float
     realtime_max_session_seconds: float
     realtime_silent_cooldown_seconds: float
+    realtime_turn_detection: str
+    realtime_vad_threshold: float
+    realtime_vad_prefix_padding_ms: int
+    realtime_vad_silence_duration_ms: int
+    realtime_semantic_vad_eagerness: str
     realtime_history_messages: int
     realtime_safety_identifier: str
     user_city: str
@@ -160,6 +141,7 @@ class Config:
     recordings_dir: Path
     tts_chunk_chars: int
     log_level: str
+    settings_file: Path = Path("/var/lib/voice-ai-bot/settings.json")
     memory_dir: Path = Path("/var/lib/voice-ai-bot/agent")
     memory_bootstrap_chars: int = 12000
     memory_active_context_chars: int = 1800
@@ -173,9 +155,26 @@ class Config:
     openweather_api_key: str = ""
     openweather_timeout_seconds: float = 10.0
     weather_cache_seconds: float = 600.0
-    voice_volume: int = 10
+    voice_volume: int = 5
     music_dir: Path = Path("/var/lib/voice-ai-bot/music")
-    music_volume: int = 8
+    music_volume: int = 4
+    camera_enabled: bool = True
+    camera_capture_on_button_press: bool = False
+    camera_device: str = "/dev/video0"
+    camera_frame_size: str = "1280x720"
+    camera_jpeg_quality: int = 85
+    camera_image_detail: str = "auto"
+    camera_images_dir: Path = Path("/var/lib/voice-ai-bot/images")
+    camera_capture_timeout_seconds: float = 6.0
+    camera_capture_command: str = ""
+    camera_max_image_bytes: int = 1_500_000
+    camera_snapshot_settle_seconds: float = 3.0
+    camera_shutter_sound_enabled: bool = True
+    camera_continuous_interval_seconds: float = 4.0
+    camera_continuous_min_interval_seconds: float = 1.0
+    camera_continuous_max_interval_seconds: float = 5.0
+    debug_web_host: str = "0.0.0.0"
+    debug_web_port: int = 400
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -211,7 +210,12 @@ class Config:
             realtime_response_timeout_seconds=_float_env("REALTIME_RESPONSE_TIMEOUT_SECONDS", 90.0),
             realtime_idle_timeout_seconds=_float_env("REALTIME_IDLE_TIMEOUT_SECONDS", 45.0),
             realtime_max_session_seconds=_float_env("REALTIME_MAX_SESSION_SECONDS", 120.0),
-            realtime_silent_cooldown_seconds=_float_env("REALTIME_SILENT_COOLDOWN_SECONDS", 5.0),
+            realtime_silent_cooldown_seconds=_float_env("REALTIME_SILENT_COOLDOWN_SECONDS", 15.0),
+            realtime_turn_detection=os.getenv("REALTIME_TURN_DETECTION", "server_vad"),
+            realtime_vad_threshold=_float_env("REALTIME_VAD_THRESHOLD", 0.5),
+            realtime_vad_prefix_padding_ms=_int_env("REALTIME_VAD_PREFIX_PADDING_MS", 300),
+            realtime_vad_silence_duration_ms=_int_env("REALTIME_VAD_SILENCE_DURATION_MS", 850),
+            realtime_semantic_vad_eagerness=os.getenv("REALTIME_SEMANTIC_VAD_EAGERNESS", "medium"),
             realtime_history_messages=_int_env("REALTIME_HISTORY_MESSAGES", 16),
             realtime_safety_identifier=os.getenv("REALTIME_SAFETY_IDENTIFIER", "voice-ai-bot-local"),
             user_city=os.getenv("USER_CITY", "Cambridge"),
@@ -251,6 +255,7 @@ class Config:
             recordings_dir=Path(os.getenv("RECORDINGS_DIR", "/var/lib/voice-ai-bot/recordings")),
             tts_chunk_chars=_int_env("TTS_CHUNK_CHARS", 240),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            settings_file=Path(os.getenv("SETTINGS_FILE", "/var/lib/voice-ai-bot/settings.json")),
             memory_dir=Path(os.getenv("MEMORY_DIR", "/var/lib/voice-ai-bot/agent")),
             memory_bootstrap_chars=_int_env("MEMORY_BOOTSTRAP_CHARS", 12000),
             memory_active_context_chars=_int_env("MEMORY_ACTIVE_CONTEXT_CHARS", 1800),
@@ -273,7 +278,30 @@ class Config:
             openweather_api_key=os.getenv("OPENWEATHER_API_KEY", "").strip(),
             openweather_timeout_seconds=_float_env("OPENWEATHER_TIMEOUT_SECONDS", 10.0),
             weather_cache_seconds=_float_env("WEATHER_CACHE_SECONDS", 600.0),
-            voice_volume=max(1, min(10, _int_env("VOICE_VOLUME", 10))),
+            voice_volume=max(1, min(10, _int_env("VOICE_VOLUME", 5))),
             music_dir=Path(os.getenv("MUSIC_DIR", "/var/lib/voice-ai-bot/music")),
-            music_volume=max(1, min(10, _int_env("MUSIC_VOLUME", 8))),
+            music_volume=max(1, min(10, _int_env("MUSIC_VOLUME", 4))),
+            camera_enabled=_bool_env("CAMERA_ENABLED", True),
+            camera_capture_on_button_press=_bool_env("CAMERA_CAPTURE_ON_BUTTON_PRESS", False),
+            camera_device=os.getenv("CAMERA_DEVICE", "/dev/video0"),
+            camera_frame_size=os.getenv("CAMERA_FRAME_SIZE", "1280x720"),
+            camera_jpeg_quality=max(1, min(100, _int_env("CAMERA_JPEG_QUALITY", 85))),
+            camera_image_detail=os.getenv("CAMERA_IMAGE_DETAIL", "auto"),
+            camera_images_dir=Path(os.getenv("CAMERA_IMAGES_DIR", "/var/lib/voice-ai-bot/images")),
+            camera_capture_timeout_seconds=_float_env("CAMERA_CAPTURE_TIMEOUT_SECONDS", 6.0),
+            camera_capture_command=os.getenv("CAMERA_CAPTURE_COMMAND", ""),
+            camera_max_image_bytes=_int_env("CAMERA_MAX_IMAGE_BYTES", 1_500_000),
+            camera_snapshot_settle_seconds=max(0.0, _float_env("CAMERA_SNAPSHOT_SETTLE_SECONDS", 3.0)),
+            camera_shutter_sound_enabled=_bool_env("CAMERA_SHUTTER_SOUND_ENABLED", True),
+            camera_continuous_interval_seconds=_float_env("CAMERA_CONTINUOUS_INTERVAL_SECONDS", 4.0),
+            camera_continuous_min_interval_seconds=max(
+                0.1,
+                _float_env("CAMERA_CONTINUOUS_MIN_INTERVAL_SECONDS", 1.0),
+            ),
+            camera_continuous_max_interval_seconds=max(
+                0.1,
+                _float_env("CAMERA_CONTINUOUS_MAX_INTERVAL_SECONDS", 5.0),
+            ),
+            debug_web_host=os.getenv("DEBUG_WEB_HOST", "0.0.0.0"),
+            debug_web_port=_int_env("DEBUG_WEB_PORT", 400),
         )

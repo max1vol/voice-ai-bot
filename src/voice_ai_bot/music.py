@@ -2,17 +2,55 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-import wave
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+import av
+from av.audio.frame import AudioFrame
+from av.audio.resampler import AudioResampler
+from av.error import FFmpegError
+
 from .audio_io import PcmOutputStream, PcmPlayer, clamp_volume_level
 from .config import Config
+from .settings import RuntimeSettings
 
 LOGGER = logging.getLogger(__name__)
+SUPPORTED_MUSIC_SUFFIXES = (".opus", ".ogg", ".wav")
+PREFERRED_MUSIC_SUFFIX_ORDER = {".opus": 0, ".ogg": 1, ".wav": 2}
+PLAYBACK_SAMPLE_RATE = 24000
+PLAYBACK_CHANNELS = 1
+PLAYBACK_SAMPLE_WIDTH = 2
+PLAYBACK_FRAME_BYTES = PLAYBACK_CHANNELS * PLAYBACK_SAMPLE_WIDTH
+GENERIC_MUSIC_QUERY_WORDS = {
+    "a",
+    "an",
+    "anything",
+    "can",
+    "could",
+    "dance",
+    "fun",
+    "music",
+    "on",
+    "play",
+    "playing",
+    "please",
+    "put",
+    "random",
+    "some",
+    "something",
+    "song",
+    "songs",
+    "start",
+    "track",
+    "tracks",
+    "tune",
+    "tunes",
+    "upbeat",
+    "whatever",
+    "you",
+}
 
 
 @dataclass(frozen=True)
@@ -24,6 +62,7 @@ class Song:
     sample_rate: int
     channels: int
     sample_width: int
+    audio_format: str
 
     @property
     def duration(self) -> str:
@@ -39,7 +78,7 @@ class Song:
             "duration": self.duration,
             "sample_rate": self.sample_rate,
             "channels": self.channels,
-            "format": "pcm_s16le_wav",
+            "format": self.audio_format,
         }
 
 
@@ -50,12 +89,16 @@ class MusicLibrary:
     def list_songs(self) -> list[Song]:
         if not self.root.exists():
             return []
-        songs = []
-        for path in sorted(self.root.glob("*.wav")):
+        songs_by_id: dict[str, Song] = {}
+        for path in sorted(self.root.iterdir()):
+            if not path.is_file() or path.suffix.casefold() not in SUPPORTED_MUSIC_SUFFIXES:
+                continue
             song = self._read_song(path)
             if song is not None:
-                songs.append(song)
-        return sorted(songs, key=lambda song: song.title.casefold())
+                existing = songs_by_id.get(song.id)
+                if existing is None or _music_suffix_order(path) < _music_suffix_order(existing.path):
+                    songs_by_id[song.id] = song
+        return sorted(songs_by_id.values(), key=lambda song: song.title.casefold())
 
     def match(self, query: str) -> Song | None:
         songs = self.list_songs()
@@ -63,7 +106,9 @@ class MusicLibrary:
             return None
         needle = normalize_song_text(query)
         if not needle:
-            return None
+            return songs[0]
+        if _is_generic_music_query(needle):
+            return songs[0]
         for song in songs:
             if song.id == needle:
                 return song
@@ -88,34 +133,37 @@ class MusicLibrary:
 
     def _read_song(self, path: Path) -> Song | None:
         try:
-            with wave.open(str(path), "rb") as wav:
-                sample_rate = wav.getframerate()
-                channels = wav.getnchannels()
-                sample_width = wav.getsampwidth()
-                frames = wav.getnframes()
-        except (wave.Error, OSError):
+            with av.open(str(path)) as container:
+                audio_stream = _first_audio_stream(container)
+                if audio_stream is None:
+                    LOGGER.warning("skipping %s: no audio stream", path)
+                    return None
+                duration_seconds = _audio_duration_seconds(container, audio_stream)
+                codec_name = audio_stream.codec_context.name or path.suffix.lstrip(".")
+        except (FFmpegError, OSError, ValueError):
             LOGGER.exception("failed to read music file %s", path)
             return None
-        if sample_width != 2:
-            LOGGER.warning("skipping %s: expected 16-bit PCM WAV, got sample width %s", path, sample_width)
-            return None
-        duration_seconds = frames / sample_rate if sample_rate else 0.0
         return Song(
             id=normalize_song_text(path.stem),
             title=title_from_stem(path.stem),
             path=path,
             duration_seconds=duration_seconds,
-            sample_rate=sample_rate,
-            channels=channels,
-            sample_width=sample_width,
+            sample_rate=PLAYBACK_SAMPLE_RATE,
+            channels=PLAYBACK_CHANNELS,
+            sample_width=PLAYBACK_SAMPLE_WIDTH,
+            audio_format=codec_name,
         )
 
 
 class MusicPlayer:
-    def __init__(self, config: Config, player: PcmPlayer | None = None):
+    def __init__(self, config: Config, player: PcmPlayer | None = None, settings: RuntimeSettings | None = None):
         self.config = config
+        self.settings = settings or RuntimeSettings(config.settings_file, config.voice_volume, config.music_volume)
         self.library = MusicLibrary(config.music_dir)
-        self.player = player or PcmPlayer(config.audio_playback_device, volume_level=config.music_volume)
+        music_volume = self.settings.music_volume()
+        self.player = player or PcmPlayer(config.audio_playback_device, volume_level=music_volume)
+        if player is not None:
+            self.player.set_volume_level(music_volume)
         self._lock = threading.RLock()
         self._state = "stopped"
         self._current: Song | None = None
@@ -211,7 +259,8 @@ class MusicPlayer:
         return {"ok": True, "status": self.status()}
 
     def set_volume(self, level: int) -> dict[str, Any]:
-        clean = self.player.set_volume_level(clamp_volume_level(level))
+        volumes = self.settings.set_music_volume(clamp_volume_level(level))
+        clean = self.player.set_volume_level(volumes["music_volume"])
         return {"ok": True, "volume": clean, "scale": clean / 10.0, "status": self.status()}
 
     def apply_deferred_after_voice(self) -> None:
@@ -286,30 +335,40 @@ class MusicPlayer:
     def _play_loop(self, song: Song, start_frame: int, generation: int, stop_event: threading.Event) -> None:
         stream = None
         try:
-            with wave.open(str(song.path), "rb") as wav:
-                wav.setpos(min(max(0, start_frame), wav.getnframes()))
-                with self.player.open_stream(rate=wav.getframerate(), channels=wav.getnchannels()) as stream:
+            start_seconds = start_frame / song.sample_rate if song.sample_rate else 0.0
+            with av.open(str(song.path)) as container:
+                audio_stream = _first_audio_stream(container)
+                if audio_stream is None:
+                    raise RuntimeError(f"music file has no audio stream: {song.path}")
+                if start_seconds > 0:
+                    _seek_audio_stream(container, audio_stream, start_seconds)
+                resampler = AudioResampler(format="s16", layout="mono", rate=song.sample_rate)
+                played_frames = max(0, start_frame)
+                with self.player.open_stream(rate=song.sample_rate, channels=song.channels) as stream:
                     with self._lock:
                         if self._generation != generation:
                             return
                         self._active_stream = stream
-                    while not stop_event.is_set():
-                        chunk = wav.readframes(2048)
-                        if not chunk:
-                            with self._lock:
-                                if self._generation == generation:
-                                    self._state = "stopped"
-                                    self._current = None
-                                    self._position_frames = 0
-                                    self._pause_reason = ""
-                                    self._active_stream = None
-                            LOGGER.info("music playback finished: %s", song.title)
+                    for chunk in _decoded_pcm_chunks(container, audio_stream, resampler, start_seconds):
+                        if stop_event.is_set():
                             return
+                        if not chunk:
+                            continue
                         stream.write(chunk)
+                        played_frames += len(chunk) // PLAYBACK_FRAME_BYTES
                         with self._lock:
                             if self._generation != generation:
                                 return
-                            self._position_frames = wav.tell()
+                            self._position_frames = played_frames
+            with self._lock:
+                if self._generation == generation:
+                    self._state = "stopped"
+                    self._current = None
+                    self._position_frames = 0
+                    self._pause_reason = ""
+                    self._active_stream = None
+            LOGGER.info("music playback finished: %s", song.title)
+            return
         except BaseException:
             with self._lock:
                 if self._generation == generation:
@@ -335,7 +394,99 @@ def title_from_stem(stem: str) -> str:
     return " ".join(word.capitalize() for word in words)
 
 
+def _is_generic_music_query(text: str) -> bool:
+    tokens = set(text.split())
+    return bool(tokens) and tokens.issubset(GENERIC_MUSIC_QUERY_WORDS)
+
+
 def format_duration(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     minutes, secs = divmod(total, 60)
     return f"{minutes}:{secs:02d}"
+
+
+def _music_suffix_order(path: Path) -> int:
+    return PREFERRED_MUSIC_SUFFIX_ORDER.get(path.suffix.casefold(), len(PREFERRED_MUSIC_SUFFIX_ORDER))
+
+
+def _first_audio_stream(container: av.container.InputContainer):
+    for stream in container.streams:
+        if stream.type == "audio":
+            return stream
+    return None
+
+
+def _audio_duration_seconds(container: av.container.InputContainer, audio_stream) -> float:
+    if audio_stream.duration is not None and audio_stream.time_base is not None:
+        return max(0.0, float(audio_stream.duration * audio_stream.time_base))
+    if container.duration is not None:
+        return max(0.0, float(container.duration) / float(av.time_base))
+    return 0.0
+
+
+def _seek_audio_stream(container: av.container.InputContainer, audio_stream, start_seconds: float) -> None:
+    if start_seconds <= 0 or audio_stream.time_base is None:
+        return
+    target = max(0, int(start_seconds / float(audio_stream.time_base)))
+    try:
+        container.seek(target, backward=True, any_frame=False, stream=audio_stream)
+    except (FFmpegError, OSError, ValueError):
+        LOGGER.warning("music seek failed for %s seconds", round(start_seconds, 3), exc_info=True)
+
+
+def _decoded_pcm_chunks(
+    container: av.container.InputContainer,
+    audio_stream,
+    resampler: AudioResampler,
+    start_seconds: float,
+):
+    drop_until_seconds = max(0.0, start_seconds)
+    for packet in container.demux(audio_stream):
+        for frame in packet.decode():
+            skip_frames = 0
+            frame_start = _frame_start_seconds(frame)
+            frame_duration = (frame.samples / frame.sample_rate) if frame.sample_rate else 0.0
+            frame_end = frame_start + frame_duration if frame_start is not None else None
+            if drop_until_seconds > 0:
+                if frame_start is None or frame_end is None:
+                    drop_until_seconds = 0.0
+                elif frame_end <= drop_until_seconds:
+                    continue
+                else:
+                    if frame_start < drop_until_seconds:
+                        skip_frames = max(0, int(round((drop_until_seconds - frame_start) * PLAYBACK_SAMPLE_RATE)))
+                    drop_until_seconds = 0.0
+            for out_frame in _coerce_audio_frames(resampler.resample(frame)):
+                chunk = bytes(out_frame.planes[0])
+                if skip_frames > 0:
+                    chunk_frames = out_frame.samples
+                    trim_now = min(skip_frames, chunk_frames)
+                    chunk = _trim_pcm_frames(chunk, trim_now)
+                    skip_frames -= trim_now
+                if chunk:
+                    yield chunk
+    for out_frame in _coerce_audio_frames(resampler.resample(None)):
+        chunk = bytes(out_frame.planes[0])
+        if chunk:
+            yield chunk
+
+
+def _coerce_audio_frames(result) -> list[AudioFrame]:
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [frame for frame in result if frame is not None]
+    return [result]
+
+
+def _frame_start_seconds(frame: AudioFrame) -> float | None:
+    if frame.pts is None or frame.time_base is None:
+        return None
+    return float(frame.pts * frame.time_base)
+
+
+def _trim_pcm_frames(chunk: bytes, skip_frames: int) -> bytes:
+    if skip_frames <= 0:
+        return chunk
+    byte_offset = min(len(chunk), skip_frames * PLAYBACK_FRAME_BYTES)
+    return chunk[byte_offset:]

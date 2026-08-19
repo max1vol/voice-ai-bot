@@ -2,7 +2,11 @@ import json
 import threading
 import time
 import wave
+from dataclasses import replace
 
+import pytest
+
+from voice_ai_bot.audio_io import RawPcmRecorder
 from voice_ai_bot.conversation import Message
 from voice_ai_bot.config import Config
 from voice_ai_bot.realtime_voice import (
@@ -10,7 +14,9 @@ from voice_ai_bot.realtime_voice import (
     CLOSE_TOOL_NAME,
     DELETE_SCHEDULED_TASK_TOOL_NAME,
     GET_WEATHER_TOOL_NAME,
+    GET_MUSIC_VOLUME_TOOL_NAME,
     GET_MUSIC_STATUS_TOOL_NAME,
+    GET_VOICE_VOLUME_TOOL_NAME,
     LIST_MUSIC_TOOL_NAME,
     LIST_SCHEDULED_TASKS_TOOL_NAME,
     MEMORY_ADD_TOOL_NAME,
@@ -24,25 +30,31 @@ from voice_ai_bot.realtime_voice import (
     PLAY_MUSIC_TOOL_NAME,
     RESUME_MUSIC_TOOL_NAME,
     START_TASK_TOOL_NAME,
+    START_CONTINUOUS_CAMERA_TOOL_NAME,
     STEER_TASK_TOOL_NAME,
     SET_MUSIC_VOLUME_TOOL_NAME,
     SET_VOICE_VOLUME_TOOL_NAME,
     STOP_MUSIC_TOOL_NAME,
+    STOP_CONTINUOUS_CAMERA_TOOL_NAME,
+    TAKE_PICTURE_TOOL_NAME,
     TASK_STATUS_TOOL_NAME,
     RealtimeConversationSession,
     BackgroundTaskManager,
     background_task_prompt,
+    conversation_item_for_camera_snapshot,
     conversation_item_for_message,
     event_is_ignorable_control_error,
     extract_response_text,
     iter_wav_pcm16_chunks,
     parse_tool_arguments,
     realtime_session_instructions,
+    realtime_turn_detection,
     realtime_turn_instructions,
     realtime_tools,
     response_function_calls,
     response_requested_close,
 )
+from voice_ai_bot.camera import CameraSnapshot
 
 
 class FakeWebSocket:
@@ -102,6 +114,38 @@ def test_conversation_item_for_saved_messages():
         "type": "message",
         "role": "assistant",
         "content": [{"type": "output_text", "text": "hello"}],
+    }
+
+
+def test_conversation_item_for_camera_snapshot_uses_auto_detail(tmp_path):
+    snapshot = CameraSnapshot(
+        path=tmp_path / "snapshot.jpg",
+        mime_type="image/jpeg",
+        size_bytes=123,
+        data_url="data:image/jpeg;base64,abc",
+    )
+
+    item = conversation_item_for_camera_snapshot(snapshot, detail="auto", note="button press")
+
+    assert item["role"] == "user"
+    assert item["content"][0] == {"type": "input_text", "text": "[Camera snapshot: button press]"}
+    assert item["content"][1] == {
+        "type": "input_image",
+        "image_url": "data:image/jpeg;base64,abc",
+        "detail": "auto",
+    }
+
+
+def test_realtime_turn_detection_defaults_to_server_vad(tmp_path):
+    config = _config(tmp_path)
+
+    assert realtime_turn_detection(config) == {
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        "silence_duration_ms": 850,
+        "create_response": False,
+        "interrupt_response": False,
     }
 
 
@@ -178,13 +222,18 @@ def test_realtime_tools_use_async_background_task_interface():
     assert DELETE_SCHEDULED_TASK_TOOL_NAME in tool_names
     assert GET_WEATHER_TOOL_NAME in tool_names
     assert SET_VOICE_VOLUME_TOOL_NAME in tool_names
+    assert GET_VOICE_VOLUME_TOOL_NAME in tool_names
     assert LIST_MUSIC_TOOL_NAME in tool_names
     assert GET_MUSIC_STATUS_TOOL_NAME in tool_names
+    assert GET_MUSIC_VOLUME_TOOL_NAME in tool_names
     assert PLAY_MUSIC_TOOL_NAME in tool_names
     assert PAUSE_MUSIC_TOOL_NAME in tool_names
     assert RESUME_MUSIC_TOOL_NAME in tool_names
     assert STOP_MUSIC_TOOL_NAME in tool_names
     assert SET_MUSIC_VOLUME_TOOL_NAME in tool_names
+    assert TAKE_PICTURE_TOOL_NAME in tool_names
+    assert START_CONTINUOUS_CAMERA_TOOL_NAME in tool_names
+    assert STOP_CONTINUOUS_CAMERA_TOOL_NAME in tool_names
     assert MEMORY_SEARCH_TOOL_NAME in tool_names
     assert MEMORY_LIST_TOOL_NAME in tool_names
     assert MEMORY_ADD_TOOL_NAME in tool_names
@@ -194,32 +243,37 @@ def test_realtime_tools_use_async_background_task_interface():
     assert "web_search" not in tool_names
 
 
-def test_realtime_session_instructions_pin_sipquest_identity(tmp_path):
+def test_realtime_session_instructions_pin_general_assistant_identity(tmp_path):
     instructions = realtime_session_instructions(_config(tmp_path))
 
-    assert "answer exactly: \"I'm SipQuest, your AI mystery drink vending assistant.\"" in instructions
-    assert "Never say that you are ChatGPT or Max Code" in instructions
-    assert "The customer does not choose an exact drink" in instructions
-    assert "CB-38" in instructions
-    assert "CB38" in instructions
-    assert "Citrus Bloom" in instructions
-    assert "XZ-72" in instructions
-    assert "XZ72" in instructions
-    assert "Azure Zenith" in instructions
-    assert "do not say Jane Street" in instructions
-    assert "The secure transaction has been sent to your watch" in instructions
+    assert "answer exactly: \"I'm Max Code, your general-purpose voice assistant.\"" in instructions
+    assert "Do not present yourself as ChatGPT" in instructions
+    assert "Do not assume a shop, vending, drink, or sales scenario" in instructions
+    assert "mystery drink vending assistant" not in instructions
+    assert "CB-38" not in instructions
+    assert "Do not preamble before quick local tool calls" in instructions
+    assert "For quick device-control confirmations" in instructions
+    assert "button presses do not automatically take pictures" in instructions
+    assert "start_continuous_camera" in instructions
+    assert "Do not store runtime device settings such as voice volume, music volume" in instructions
 
 
-def test_realtime_turn_instructions_pin_sipquest_code_reveals(tmp_path):
+def test_memory_add_tool_description_excludes_runtime_device_settings():
+    memory_add = next(tool for tool in realtime_tools() if tool["name"] == MEMORY_ADD_TOOL_NAME)
+
+    assert "Do not use this for runtime device settings" in memory_add["description"]
+    assert "voice volume or music volume" in memory_add["parameters"]["properties"]["text"]["description"]
+
+
+def test_realtime_turn_instructions_enforce_direct_short_confirmations(tmp_path):
     instructions = realtime_turn_instructions(_config(tmp_path))
 
-    assert "You are SipQuest" in instructions
-    assert "The customer chooses a quest direction, not an exact flavor" in instructions
-    assert "CB-38 or CB38" in instructions
-    assert "XZ-72 or XZ72" in instructions
-    assert "secure transaction has been sent to the user's watch" in instructions
-    assert "Never call it drink number one" in instructions
-    assert "Never call it drink number two" in instructions
+    assert "You are Max Code, a general-purpose voice assistant" in instructions
+    assert "Do not present yourself as ChatGPT" in instructions
+    assert "Do not steer the conversation into shopkeeping, vending" in instructions
+    assert "CB-38" not in instructions
+    assert "If a fast local tool result is available, answer directly with no preamble" in instructions
+    assert "usually under 10 words" in instructions
 
 
 def test_interrupt_skips_truncate_when_session_is_closed(tmp_path):
@@ -270,7 +324,7 @@ def test_response_created_is_ignored_until_response_create_was_sent(tmp_path):
     assert session._active_response_id == "new_response"
 
 
-def test_stale_response_events_do_not_pollute_barge_in_turn(tmp_path):
+def test_response_events_are_ignored_while_recording(tmp_path):
     session = RealtimeConversationSession(_config(tmp_path))
     with session._state_lock:
         session._recorder = object()
@@ -281,31 +335,91 @@ def test_stale_response_events_do_not_pollute_barge_in_turn(tmp_path):
         {
             "type": "response.output_audio_transcript.delta",
             "response_id": "old_response",
-            "delta": "old speech",
+            "delta": "stale output",
         }
     )
 
     assert session._output_transcript_parts == []
 
+
+def test_output_audio_is_not_played_while_recording(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+
+    class FailingPlayer:
+        def open_stream(self, **kwargs):
+            raise AssertionError("playback should not open while recording")
+
+    session.player = FailingPlayer()
     with session._state_lock:
-        session._recorder = None
-        session._response_active = False
-        session._response_pending = True
-        session._active_response_id = ""
+        session._recorder = object()
+
+    session._write_output_audio(b"1234")
+
+    assert session._output_audio_bytes == 4
+
+
+def test_server_vad_committed_audio_starts_app_created_response(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    ws = FakeWebSocket()
+    with session._state_lock:
+        session._ws = ws
+
+    session._handle_event({"type": "input_audio_buffer.committed", "item_id": "item_1"})
+    assert session._response_pending
+    assert session._waiting_for_input_transcript
 
     session._handle_event(
         {
-            "type": "response.done",
-            "response": {
-                "id": "old_response",
-                "status": "completed",
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": "stale"}]}],
-            },
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "please look at the board",
         }
     )
 
-    assert session.pop_completed_turns() == []
-    assert session._response_pending
+    deadline = time.time() + 1
+    while time.time() < deadline and not any(event["type"] == "response.create" for event in ws.sent):
+        time.sleep(0.01)
+
+    response_events = [event for event in ws.sent if event["type"] == "response.create"]
+    assert response_events
+    assert response_events[0]["response"]["output_modalities"] == ["audio"]
+
+
+def test_speech_started_during_assistant_response_is_treated_as_echo(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    ws = FakeWebSocket()
+    with session._state_lock:
+        session._ws = ws
+        session._response_active = True
+        session._active_response_id = "response_1"
+        session._input_transcript_final = "does it work?"
+
+    session._handle_event({"type": "input_audio_buffer.speech_started"})
+
+    assert not any(event["type"] == "response.cancel" for event in ws.sent)
+    assert session._response_active
+
+    session._handle_event({"type": "input_audio_buffer.committed"})
+    session._handle_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "speaker echo",
+        }
+    )
+
+    assert session._input_transcript_final == "does it work?"
+
+    session._handle_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "response_1",
+            "delta": "Yes.",
+        }
+    )
+    session._handle_event({"type": "response.done", "response": {"id": "response_1", "status": "completed"}})
+
+    [turn] = session.pop_completed_turns()
+    assert turn.user_text == "does it work?"
+    assert turn.assistant_text == "Yes."
 
 
 def test_running_background_task_does_not_count_as_live_response(tmp_path):
@@ -316,6 +430,48 @@ def test_running_background_task_does_not_count_as_live_response(tmp_path):
     assert session.tasks.has_running()
     assert not session.is_responding
     assert not session.is_voice_busy
+
+
+def test_active_recording_counts_as_voice_busy(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    with session._state_lock:
+        session._recorder = object()
+
+    assert not session.is_responding
+    assert session.is_voice_busy
+
+
+def test_realtime_session_defaults_to_pi_raw_recorder(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+
+    assert isinstance(session._recorder_factory(), RawPcmRecorder)
+
+
+def test_begin_turn_cleans_up_when_recorder_start_fails(tmp_path):
+    class FailingRecorder:
+        def __init__(self):
+            self.stopped = False
+
+        def start(self):
+            raise FileNotFoundError("missing recorder")
+
+        def stop(self):
+            self.stopped = True
+            return 0.0
+
+        def read(self, size=4096):
+            return b""
+
+    recorder = FailingRecorder()
+    session = RealtimeConversationSession(_config(tmp_path), recorder_factory=lambda: recorder)
+
+    with pytest.raises(FileNotFoundError):
+        session.begin_turn([])
+
+    assert recorder.stopped
+    assert not session.is_recording
+    assert not session.is_voice_busy
+    assert session._capture_queue is None
 
 
 def test_background_task_wakeup_queue_marks_reported(tmp_path):
@@ -564,25 +720,87 @@ def test_weather_tool_passes_cache_and_location_arguments(tmp_path):
     calls = []
 
     class FakeWeather:
-        def get_current_weather(self, location="", units="metric", no_cache=False):
-            calls.append((location, units, no_cache))
-            return {"ok": True, "location_query": location, "cached": not no_cache}
+        def get_weather(self, location="", units="metric", no_cache=False, forecast_days=0):
+            calls.append((location, units, no_cache, forecast_days))
+            return {"ok": True, "location_query": location, "cached": not no_cache, "forecast_days_requested": forecast_days}
 
     session.weather = FakeWeather()
 
     output = session._execute_realtime_tool_call(
         {
             "name": GET_WEATHER_TOOL_NAME,
-            "arguments": json.dumps({"location": "London,GB", "units": "metric", "no_cache": True}),
+            "arguments": json.dumps(
+                {"location": "London,GB", "units": "metric", "no_cache": True, "forecast_days": 4}
+            ),
         }
     )
 
     assert output["ok"]
-    assert calls == [("London,GB", "metric", True)]
+    assert output["forecast_days_requested"] == 4
+    assert calls == [("London,GB", "metric", True, 4)]
+
+
+def test_background_task_tools_include_weather(tmp_path):
+    manager = BackgroundTaskManager(_config(tmp_path))
+
+    tool_names = {tool["name"] for tool in manager._task_tools() if tool.get("type") == "function"}
+
+    assert TASK_STATUS_TOOL_NAME in tool_names
+    assert GET_WEATHER_TOOL_NAME in tool_names
+
+
+def test_background_task_strict_function_schemas_are_closed(tmp_path):
+    manager = BackgroundTaskManager(_config(tmp_path))
+
+    for tool in manager._task_tools():
+        if tool.get("type") != "function" or not tool.get("strict"):
+            continue
+        parameters = tool["parameters"]
+        property_names = set(parameters.get("properties", {}))
+
+        assert parameters["type"] == "object"
+        assert parameters.get("additionalProperties") is False
+        assert set(parameters.get("required", [])) == property_names
+
+
+def test_background_task_weather_tool_executes_local_service(tmp_path):
+    manager = BackgroundTaskManager(_config(tmp_path))
+    calls = []
+
+    class FakeWeather:
+        def get_weather(self, location="", units="metric", no_cache=False, forecast_days=0):
+            calls.append((location, units, no_cache, forecast_days))
+            return {"ok": True, "location_query": location, "forecast_days_requested": forecast_days}
+
+    manager.weather = FakeWeather()
+
+    outputs = manager._function_call_outputs(
+        "task_123",
+        Obj(
+            output=[
+                Obj(
+                    type="function_call",
+                    name=GET_WEATHER_TOOL_NAME,
+                    call_id="call_weather",
+                    arguments=json.dumps(
+                        {"location": "Edinburgh,GB", "units": "metric", "forecast_days": 3, "no_cache": True}
+                    ),
+                )
+            ]
+        ),
+    )
+
+    assert calls == [("Edinburgh,GB", "metric", True, 3)]
+    assert json.loads(outputs[0]["output"]) == {
+        "ok": True,
+        "location_query": "Edinburgh,GB",
+        "forecast_days_requested": 3,
+    }
 
 
 def test_set_voice_volume_tool_updates_player(tmp_path):
-    session = RealtimeConversationSession(_config(tmp_path))
+    config = _config(tmp_path)
+    session = RealtimeConversationSession(config)
 
     output = session._execute_realtime_tool_call(
         {"name": SET_VOICE_VOLUME_TOOL_NAME, "arguments": json.dumps({"level": 4})}
@@ -590,6 +808,25 @@ def test_set_voice_volume_tool_updates_player(tmp_path):
 
     assert output == {"ok": True, "volume": 4, "scale": 0.4}
     assert session.player.volume_level() == 4
+    assert json.loads(config.settings_file.read_text(encoding="utf-8")) == {"music_volume": 4, "voice_volume": 4}
+
+
+def test_get_volume_tools_report_current_levels(tmp_path):
+    config = _config(tmp_path)
+    session = RealtimeConversationSession(config)
+    session._execute_realtime_tool_call({"name": SET_VOICE_VOLUME_TOOL_NAME, "arguments": json.dumps({"level": 7})})
+
+    class FakeMusic:
+        def status(self):
+            return {"ok": True, "state": "stopped", "volume": 3}
+
+    session.music = FakeMusic()
+
+    voice = session._execute_realtime_tool_call({"name": GET_VOICE_VOLUME_TOOL_NAME, "arguments": "{}"})
+    music = session._execute_realtime_tool_call({"name": GET_MUSIC_VOLUME_TOOL_NAME, "arguments": "{}"})
+
+    assert voice == {"ok": True, "volume": 7, "scale": 0.7}
+    assert music == {"ok": True, "volume": 3, "scale": 0.3}
 
 
 def test_music_tools_delegate_to_music_player(tmp_path):
@@ -603,7 +840,7 @@ def test_music_tools_delegate_to_music_player(tmp_path):
 
         def status(self):
             calls.append(("status",))
-            return {"ok": True, "state": "stopped"}
+            return {"ok": True, "state": "stopped", "volume": 4}
 
         def request_play(self, query):
             calls.append(("play", query))
@@ -645,6 +882,107 @@ def test_music_tools_delegate_to_music_player(tmp_path):
     ]
 
 
+def test_take_picture_tool_attaches_image_item(tmp_path):
+    session = RealtimeConversationSession(_config(tmp_path))
+    ws = FakeWebSocket()
+    with session._state_lock:
+        session._ws = ws
+    session.ensure_open = lambda history: None
+    shutter_calls = []
+    session._play_camera_shutter = lambda: shutter_calls.append("shutter")
+
+    class FakeCamera:
+        def capture(self, settle_seconds=None, shutter_callback=None):
+            assert settle_seconds == 3.0
+            assert shutter_callback is not None
+            shutter_callback()
+            return CameraSnapshot(
+                path=tmp_path / "snapshot.jpg",
+                mime_type="image/jpeg",
+                size_bytes=3,
+                data_url="data:image/jpeg;base64,abc",
+            )
+
+    session.camera = FakeCamera()
+
+    output = session._execute_realtime_tool_call(
+        {"name": TAKE_PICTURE_TOOL_NAME, "arguments": json.dumps({"reason": "check board"})}
+    )
+
+    assert output == {
+        "ok": True,
+        "path": str(tmp_path / "snapshot.jpg"),
+        "bytes": 3,
+        "detail": "auto",
+    }
+    assert ws.sent[0]["type"] == "conversation.item.create"
+    assert ws.sent[0]["item"]["content"][1]["type"] == "input_image"
+    assert shutter_calls == ["shutter"]
+
+
+def test_continuous_camera_tool_starts_updates_and_stops(monkeypatch, tmp_path):
+    config = replace(_config(tmp_path), camera_snapshot_settle_seconds=0.0)
+    session = RealtimeConversationSession(config)
+    ws = FakeWebSocket()
+    with session._state_lock:
+        session._ws = ws
+    session.ensure_open = lambda history: None
+    started = []
+    closed = []
+
+    class FakeContinuousCamera:
+        def __init__(self, _config):
+            self.config = _config
+
+        def start(self):
+            started.append("start")
+
+        def snapshot(self, note="", timeout=None):
+            return CameraSnapshot(
+                path=tmp_path / "continuous.jpg",
+                mime_type="image/jpeg",
+                size_bytes=3,
+                data_url="data:image/jpeg;base64,abc",
+            )
+
+        def close(self):
+            closed.append("close")
+
+    monkeypatch.setattr("voice_ai_bot.realtime_voice.ContinuousCameraCapture", FakeContinuousCamera)
+
+    output = session._execute_realtime_tool_call(
+        {
+            "name": START_CONTINUOUS_CAMERA_TOOL_NAME,
+            "arguments": json.dumps({"reason": "tic tac toe", "interval_seconds": 0.2}),
+        }
+    )
+
+    assert output["ok"]
+    assert output["active"]
+    assert output["interval_seconds"] == 1.0
+    deadline = time.monotonic() + 1.0
+    while not ws.sent and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ws.sent[0]["item"]["content"][0]["text"] == "[Camera snapshot: continuous camera: tic tac toe]"
+
+    updated = session._execute_realtime_tool_call(
+        {
+            "name": START_CONTINUOUS_CAMERA_TOOL_NAME,
+            "arguments": json.dumps({"reason": "faster board", "interval_seconds": 9}),
+        }
+    )
+    assert updated["updated"]
+    assert updated["interval_seconds"] == 5.0
+
+    stopped = session._execute_realtime_tool_call(
+        {"name": STOP_CONTINUOUS_CAMERA_TOOL_NAME, "arguments": json.dumps({"reason": "done"})}
+    )
+
+    assert stopped == {"ok": True, "active": False, "stopped": True}
+    assert started == ["start"]
+    assert closed
+
+
 def _config(tmp_path):
     return Config(
         openai_api_key="sk-test",
@@ -667,6 +1005,11 @@ def _config(tmp_path):
         realtime_idle_timeout_seconds=1.0,
         realtime_max_session_seconds=1.0,
         realtime_silent_cooldown_seconds=5.0,
+        realtime_turn_detection="server_vad",
+        realtime_vad_threshold=0.5,
+        realtime_vad_prefix_padding_ms=300,
+        realtime_vad_silence_duration_ms=850,
+        realtime_semantic_vad_eagerness="medium",
         realtime_history_messages=4,
         realtime_safety_identifier="test",
         user_city="Cambridge",
@@ -702,5 +1045,6 @@ def _config(tmp_path):
         recordings_dir=tmp_path / "recordings",
         tts_chunk_chars=240,
         log_level="INFO",
+        settings_file=tmp_path / "settings.json",
         memory_dir=tmp_path / "agent",
     )

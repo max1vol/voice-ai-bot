@@ -79,11 +79,13 @@ def read_pair_list(value: str | None) -> list[tuple[str, str]]:
 
 
 project_root = Path(__file__).resolve().parents[1]
+repo_root = project_root.parents[1]
 values: dict[str, str] = {}
 for path in (
-    project_root / ".env",
     Path.home() / ".wifi",
     Path.home() / ".zshrc-secrets",
+    repo_root / ".env",
+    project_root / ".env",
 ):
     values.update(read_key_value_file(path))
 

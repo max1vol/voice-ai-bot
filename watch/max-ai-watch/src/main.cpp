@@ -8,12 +8,15 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp32-hal-bt.h>
 #include <esp_sleep.h>
+#include <esp_sntp.h>
 #include <math.h>
+#include <sys/time.h>
 #include <time.h>
 
 namespace {
@@ -60,12 +63,17 @@ constexpr char kSpeechPath[] = "/speech.mp3";
 constexpr char kHeaderDefaultText[] = "Max AI Watch";
 constexpr char kOpenAiSpeechHost[] = "api.openai.com";
 constexpr char kOpenAiSpeechPath[] = "/v1/audio/speech";
+constexpr uint32_t kRtcUtcFormatVersion = 20260630;
+constexpr char kTimePreferencesNamespace[] = "max-ai-time";
+constexpr char kRtcFormatPreferenceKey[] = "rtc-utc-ver";
 
 TTGOClass *watch = nullptr;
 TFT_eSPI *display = nullptr;
 
 bool timeSynced = false;
 bool usedRtcFallback = false;
+volatile uint32_t ntpSyncSequence = 0;
+uint32_t appliedNtpSyncSequence = 0;
 int lastMinuteOfDay = -1;
 int lastYearDay = -1;
 bool backlightOn = true;
@@ -85,8 +93,10 @@ uint32_t headerStatusUntilMs = 0;
 char lastStatusText[48] = "";
 char headerStatusText[24] = "Max AI Watch";
 char lastHeaderStatusText[24] = "";
-int nextWifiNetworkIndex = 0;
+RTC_DATA_ATTR int nextWifiNetworkIndex = 0;
 int activeWifiNetworkIndex = -1;
+volatile uint8_t lastWifiDisconnectReason = 0;
+volatile bool wifiDisconnectReasonAvailable = false;
 int16_t touchStartX = 0;
 int16_t touchStartY = 0;
 int16_t touchLastX = 0;
@@ -104,6 +114,7 @@ bool voiceToggleTouchConsumed = false;
 bool headerStatusError = false;
 bool lastHeaderStatusError = false;
 bool lastWeatherFetchNetworkError = false;
+bool wifiConnectionFailed = false;
 uint8_t tapCount = 0;
 uint32_t drawerLastInteractionMs = 0;
 esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
@@ -128,6 +139,7 @@ struct WeatherStatus {
 WeatherStatus cachedWeather {false, 0, false, "", 0, 0};
 RTC_DATA_ATTR WeatherStatus rtcCachedWeather {false, 0, false, "", 0, 0};
 RTC_DATA_ATTR time_t rtcLastNtpSyncEpoch = 0;
+RTC_DATA_ATTR uint32_t rtcUtcFormatVersion = 0;
 
 void refreshStatusIcons(bool force = false);
 void serviceUiDuringBlocking();
@@ -400,7 +412,7 @@ void drawWifiIcon(int bars)
         display->fillRoundRect(barX, baseY - barH, 4, barH, 1, color);
     }
 
-    if (bars < 0) {
+    if (bars < 0 && wifiConnectionFailed) {
         const uint16_t offline = dimColor(230, 72, 72);
         display->drawLine(25, 24, 51, 40, offline);
         display->drawLine(25, 25, 51, 41, offline);
@@ -499,13 +511,96 @@ bool getLocalTimeInfo(tm &info, uint32_t timeoutMs = 10)
     return getLocalTime(&info, timeoutMs);
 }
 
+void onNtpTimeAvailable(timeval *tv)
+{
+    (void)tv;
+    ntpSyncSequence++;
+}
+
+uint32_t persistedRtcUtcFormatVersion()
+{
+    Preferences preferences;
+    if (!preferences.begin(kTimePreferencesNamespace, true)) {
+        Serial.println("[time] RTC format preferences unavailable");
+        return 0;
+    }
+
+    const uint32_t version = preferences.getUInt(kRtcFormatPreferenceKey, 0);
+    preferences.end();
+    return version;
+}
+
+void markRtcAsUtc()
+{
+    rtcUtcFormatVersion = kRtcUtcFormatVersion;
+
+    Preferences preferences;
+    if (!preferences.begin(kTimePreferencesNamespace, false)) {
+        Serial.println("[time] RTC UTC marker could not be persisted");
+        return;
+    }
+
+    if (preferences.getUInt(kRtcFormatPreferenceKey, 0) != kRtcUtcFormatVersion) {
+        preferences.putUInt(kRtcFormatPreferenceKey, kRtcUtcFormatVersion);
+    }
+    preferences.end();
+}
+
 void syncRtcFromSystem()
 {
     if (watch->rtc == nullptr) {
         return;
     }
-    watch->rtc->syncToRtc();
-    Serial.println("[time] RTC updated from NTP time");
+
+    time_t now = 0;
+    time(&now);
+    if (now < 1600000000) {
+        Serial.println("[time] RTC update skipped: system time is invalid");
+        return;
+    }
+
+    tm utcInfo {};
+    gmtime_r(&now, &utcInfo);
+    watch->rtc->setDateTime(
+        utcInfo.tm_year + 1900,
+        utcInfo.tm_mon + 1,
+        utcInfo.tm_mday,
+        utcInfo.tm_hour,
+        utcInfo.tm_min,
+        utcInfo.tm_sec
+    );
+    markRtcAsUtc();
+    Serial.println("[time] RTC updated from NTP time in UTC");
+}
+
+bool recordObservedNtpSync(const char *source)
+{
+    const uint32_t sequence = ntpSyncSequence;
+    if (sequence == 0 || sequence == appliedNtpSyncSequence) {
+        return false;
+    }
+
+    tm info {};
+    if (!getLocalTimeInfo(info, 100)) {
+        return false;
+    }
+
+    appliedNtpSyncSequence = sequence;
+    syncRtcFromSystem();
+    timeSynced = true;
+    usedRtcFallback = false;
+    rtcLastNtpSyncEpoch = currentEpoch();
+    lastMinuteOfDay = -1;
+    lastYearDay = -1;
+    lastStatusText[0] = '\0';
+
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z", &info);
+    Serial.print("[time] NTP synced via ");
+    Serial.print(source);
+    Serial.print(": ");
+    Serial.println(stamp);
+    return true;
 }
 
 bool syncTimeFromNtp()
@@ -515,45 +610,122 @@ bool syncTimeFromNtp()
         return false;
     }
 
+    if (recordObservedNtpSync("pending")) {
+        return true;
+    }
+
     Serial.println("[time] Starting NTP sync for Europe/London");
+    const uint32_t startedSequence = ntpSyncSequence;
     setenv("TZ", kTimezoneLondon, 1);
     tzset();
+    sntp_set_time_sync_notification_cb(onNtpTimeAvailable);
     configTzTime(kTimezoneLondon, kNtpServer1, kNtpServer2, kNtpServer3);
+    sntp_set_time_sync_notification_cb(onNtpTimeAvailable);
 
-    tm info {};
-    for (int i = 0; i < 20; ++i) {
-        if (getLocalTimeInfo(info, 500)) {
-            syncRtcFromSystem();
-            timeSynced = true;
-            usedRtcFallback = false;
-            rtcLastNtpSyncEpoch = currentEpoch();
-            char stamp[32];
-            strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z", &info);
-            Serial.print("[time] NTP synced: ");
-            Serial.println(stamp);
-            return true;
+    for (int i = 0; i < 40; ++i) {
+        if (ntpSyncSequence != startedSequence) {
+            if (recordObservedNtpSync("network")) {
+                return true;
+            }
+            if (appliedNtpSyncSequence == ntpSyncSequence && timeSynced) {
+                return true;
+            }
         }
-        delayWithUi(100);
+        delayWithUi(250);
     }
-    Serial.println("[time] NTP sync failed; will retry");
+    Serial.println("[time] NTP sync failed: no SNTP response; will retry");
     return false;
 }
 
 bool syncSystemFromRtc()
 {
     if (watch->rtc == nullptr || !watch->rtc->isValid()) {
+        Serial.println("[time] RTC fallback unavailable: RTC is missing or invalid");
         return false;
     }
 
+    const bool rtcKnownUtc =
+        rtcUtcFormatVersion == kRtcUtcFormatVersion ||
+        persistedRtcUtcFormatVersion() == kRtcUtcFormatVersion;
+    if (rtcKnownUtc) {
+        rtcUtcFormatVersion = kRtcUtcFormatVersion;
+    } else {
+        Serial.println(
+            "[time] RTC UTC marker missing; assuming valid RTC is UTC until NTP corrects it"
+        );
+    }
+
+    RTC_Date dt = watch->rtc->getDateTime();
+    tm utcInfo {};
+    utcInfo.tm_year = dt.year - 1900;
+    utcInfo.tm_mon = dt.month - 1;
+    utcInfo.tm_mday = dt.day;
+    utcInfo.tm_hour = dt.hour;
+    utcInfo.tm_min = dt.minute;
+    utcInfo.tm_sec = dt.second;
+    utcInfo.tm_isdst = 0;
+
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    time_t epoch = mktime(&utcInfo);
     setenv("TZ", kTimezoneLondon, 1);
     tzset();
-    watch->rtc->syncToSystem();
+    if (epoch < 1600000000) {
+        Serial.println("[time] RTC fallback rejected: invalid UTC time");
+        return false;
+    }
+
+    timeval tv {};
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
     usedRtcFallback = true;
-    Serial.println("[time] System time loaded from RTC fallback");
+    Serial.println("[time] System time loaded from RTC fallback in UTC");
     return true;
 }
 
-void connectWifi()
+void maintainNtpSync()
+{
+    if (ntpSyncSequence != appliedNtpSyncSequence) {
+        recordObservedNtpSync("async");
+    }
+}
+
+const char *wifiDisconnectReasonName(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND:
+        return "no AP found";
+    case WIFI_REASON_AUTH_FAIL:
+        return "authentication failed";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "association failed";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "handshake timed out";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "connection failed";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "beacon timed out";
+    case WIFI_REASON_MISSING_ACKS:
+        return "missing ACKs";
+    case WIFI_REASON_TIMEOUT:
+        return "timed out";
+    default:
+        return "other";
+    }
+}
+
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    if (event != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        return;
+    }
+
+    lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+    wifiDisconnectReasonAvailable = true;
+}
+
+void connectWifiNetwork(int networkIndex)
 {
     if (WiFi.status() == WL_CONNECTED) {
         return;
@@ -563,12 +735,22 @@ void connectWifi()
         return;
     }
 
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(true);
-    WiFi.disconnect();
+    if (networkIndex < 0 || networkIndex >= WIFI_NETWORK_COUNT) {
+        Serial.println("[wifi] Invalid network index");
+        return;
+    }
 
-    activeWifiNetworkIndex = nextWifiNetworkIndex;
-    nextWifiNetworkIndex = (nextWifiNetworkIndex + 1) % WIFI_NETWORK_COUNT;
+    WiFi.mode(WIFI_STA);
+    // Network use is brief and the radio is shut down after each task. Keeping
+    // modem sleep disabled here avoids missed association acknowledgements.
+    WiFi.setSleep(false);
+    WiFi.disconnect(false, false);
+    delayWithUi(150);
+
+    activeWifiNetworkIndex = networkIndex;
+    lastWifiDisconnectReason = 0;
+    wifiDisconnectReasonAvailable = false;
+    wifiConnectionFailed = false;
 
     Serial.print("[wifi] Connecting to ");
     Serial.println(WIFI_SSIDS[activeWifiNetworkIndex]);
@@ -586,6 +768,8 @@ bool waitForWifi(uint32_t timeoutMs)
     }
 
     if (WiFi.status() == WL_CONNECTED) {
+        nextWifiNetworkIndex = activeWifiNetworkIndex;
+        wifiConnectionFailed = false;
         Serial.print("[wifi] Connected to ");
         Serial.print(WiFi.SSID());
         Serial.print(", IP=");
@@ -600,19 +784,58 @@ bool waitForWifi(uint32_t timeoutMs)
     } else {
         Serial.println("[wifi] Connection timed out");
     }
+    Serial.print("[wifi] Final status=");
+    Serial.print(static_cast<int>(WiFi.status()));
+    if (wifiDisconnectReasonAvailable) {
+        const uint8_t reason = lastWifiDisconnectReason;
+        Serial.print(" disconnect reason=");
+        Serial.print(reason);
+        Serial.print(" (");
+        Serial.print(wifiDisconnectReasonName(reason));
+        Serial.println(")");
+    } else {
+        Serial.println(" without a disconnect reason");
+    }
     return false;
 }
 
 bool connectWifiOrdered(uint32_t perNetworkTimeoutMs)
 {
-    for (int i = 0; i < WIFI_NETWORK_COUNT; ++i) {
-        connectWifi();
+    if (WIFI_NETWORK_COUNT <= 0) {
+        Serial.println("[wifi] No configured networks");
+        wifiConnectionFailed = true;
+        shutdownRadio("no configured networks");
+        return false;
+    }
+
+    if (nextWifiNetworkIndex < 0 || nextWifiNetworkIndex >= WIFI_NETWORK_COUNT) {
+        nextWifiNetworkIndex = 0;
+    }
+    const int preferredNetworkIndex = nextWifiNetworkIndex;
+
+    // The access point can occasionally miss the ESP32's first association.
+    // Retry the last successful network before falling back to other SSIDs.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        connectWifiNetwork(preferredNetworkIndex);
+        if (waitForWifi(perNetworkTimeoutMs)) {
+            return true;
+        }
+        if (attempt == 0) {
+            Serial.println("[wifi] Retrying preferred network");
+            delayWithUi(500);
+        }
+    }
+
+    for (int offset = 1; offset < WIFI_NETWORK_COUNT; ++offset) {
+        const int networkIndex = (preferredNetworkIndex + offset) % WIFI_NETWORK_COUNT;
+        connectWifiNetwork(networkIndex);
         if (waitForWifi(perNetworkTimeoutMs)) {
             return true;
         }
     }
 
     Serial.println("[wifi] All configured networks failed");
+    wifiConnectionFailed = true;
     shutdownRadio("connect failed");
     return false;
 }
@@ -621,6 +844,7 @@ const char *syncLabel();
 
 void maintainWifiAndTime()
 {
+    maintainNtpSync();
     const uint32_t nowMs = millis();
 
     if (WiFi.status() == WL_CONNECTED && !ttsBusy) {
@@ -1567,6 +1791,7 @@ void serviceUiDuringBlocking()
         return;
     }
 
+    maintainNtpSync();
     maintainTouchWake();
     maintainHeaderStatus();
     refreshStatusIcons();
@@ -1628,6 +1853,7 @@ SpeechDownloadResult downloadSpeechMp3(const String &input)
     HTTPClient http;
     http.setTimeout(20000);
     http.setReuse(false);
+    http.useHTTP10(true);
     if (!http.begin(client, kOpenAiSpeechHost, 443, kOpenAiSpeechPath, true)) {
         Serial.println("[tts] HTTP begin failed");
         speech.close();
@@ -1666,15 +1892,18 @@ SpeechDownloadResult downloadSpeechMp3(const String &input)
         return code <= 0 ? SpeechDownloadResult::NetworkError : SpeechDownloadResult::TtsError;
     }
 
+    Serial.print("[tts] HTTP OK response size: ");
+    Serial.println(http.getSize());
     const int written = http.writeToStream(&speech);
     serviceUiDuringBlocking();
     http.end();
     speech.close();
 
     if (written <= 0) {
-        Serial.println("[tts] no MP3 bytes written");
+        Serial.print("[tts] MP3 write failed, result=");
+        Serial.println(written);
         SPIFFS.remove(kSpeechPath);
-        return SpeechDownloadResult::NetworkError;
+        return SpeechDownloadResult::TtsError;
     }
 
     Serial.print("[tts] MP3 bytes saved: ");
@@ -1740,13 +1969,25 @@ void handleTtsRequest()
     wakeBacklight("tts");
 
     setHeaderStatus("connecting...");
-    if (WiFi.status() != WL_CONNECTED && !connectWifiOrdered(5000)) {
+    if (WiFi.status() != WL_CONNECTED && !connectWifiOrdered(10000)) {
         setHeaderError("net error");
         shutdownRadio("tts wifi error");
         ttsBusy = false;
         resetTouchState();
         suppressTouchTap(1200);
         return;
+    }
+
+    if (!timeSynced || usedRtcFallback || ntpSyncDue()) {
+        setHeaderStatus("time...");
+        if (!syncTimeFromNtp() && !timeSynced) {
+            setHeaderError("time error");
+            shutdownRadio("tts time error");
+            ttsBusy = false;
+            resetTouchState();
+            suppressTouchTap(1200);
+            return;
+        }
     }
 
     setHeaderStatus("weather...");
@@ -1807,6 +2048,7 @@ void setup()
 
     watch = TTGOClass::getWatch();
     watch->begin();
+    WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     const bool timerMaintenanceWake =
         bootWakeCause == ESP_SLEEP_WAKEUP_TIMER && !externalPowerPresent();
     if (timerMaintenanceWake) {

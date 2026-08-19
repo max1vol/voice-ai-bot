@@ -17,6 +17,7 @@ from .memory_consolidation import MemoryConsolidator
 from .openai_voice import OpenAIVoiceClient
 from .realtime_voice import RealtimeConversationSession
 from .scheduled_tasks import ScheduledTask, ScheduledTaskStore
+from .settings import RuntimeSettings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -31,9 +32,11 @@ class VoiceDaemon:
         self.memory.ensure_workspace()
         self.memory_consolidator = MemoryConsolidator(config, self.memory)
         self.scheduled_tasks = ScheduledTaskStore(config)
-        self.openai = OpenAIVoiceClient(config) if config.voice_bot_backend == "responses" else None
+        self.settings = RuntimeSettings(config.settings_file, config.voice_volume, config.music_volume)
+        self.settings.ensure()
+        self.openai = OpenAIVoiceClient(config, self.settings) if config.voice_bot_backend == "responses" else None
         self.realtime = (
-            RealtimeConversationSession(config, self.scheduled_tasks, self.memory)
+            RealtimeConversationSession(config, self.scheduled_tasks, self.memory, settings=self.settings)
             if config.voice_bot_backend == "realtime"
             else None
         )
@@ -104,8 +107,9 @@ class VoiceDaemon:
         assert self.realtime is not None
         LOGGER.info("realtime button pressed")
         self._set_led_mode("on")
+        history = self.conversation.load()
         self.realtime.pause_music_for_voice()
-        self.realtime.begin_turn(self.conversation.load())
+        self.realtime.begin_turn(history)
         self.hardware.wait_for_release()
         duration = self.realtime.stop_recording()
         LOGGER.info("realtime button released after %.3fs", duration)
@@ -148,10 +152,10 @@ class VoiceDaemon:
 
     def _sync_realtime_led(self) -> None:
         assert self.realtime is not None
-        if self.realtime.is_recording:
-            self._set_led_mode("on")
-        elif self.realtime.is_responding:
+        if self.realtime.is_responding:
             self._set_led_mode("blink")
+        elif self.realtime.is_recording:
+            self._set_led_mode("on")
         else:
             self._set_led_mode("off")
 
