@@ -28,7 +28,7 @@ Behavior:
 Two backends are available:
 
 - `VOICE_BOT_BACKEND=responses`: the original flow, using speech-to-text, GPT-5.5, and TTS.
-- `VOICE_BOT_BACKEND=realtime`: a persistent push-to-talk WebSocket session using `gpt-realtime-2`. It disables VAD, streams PCM from the mic while the button is held, streams PCM audio back to the speaker, supports button barge-in, can start/list/inspect/cancel background GPT-5.5 tasks, can manage memory and scheduled reminders/alarms, and closes on idle timeout, hard session timeout, double-click, or when the model calls `close_realtime_session`.
+- `VOICE_BOT_BACKEND=realtime`: a persistent push-to-talk WebSocket session using `gpt-realtime-2.1`. It disables VAD, streams PCM from the mic while the button is held, streams PCM audio back to the speaker, supports button barge-in, can start/list/inspect/cancel background GPT-5.5 tasks, can manage memory and scheduled reminders/alarms, and closes on idle timeout, hard session timeout, double-click, or when the model calls `close_realtime_session`.
 
 Memory works in two layers:
 
@@ -94,7 +94,7 @@ For the realtime backend, record at 24 kHz mono PCM:
 VOICE_BOT_BACKEND=realtime
 RECORD_RATE=24000
 REALTIME_INPUT_RATE=24000
-REALTIME_MODEL=gpt-realtime-2
+REALTIME_MODEL=gpt-realtime-2.1
 REALTIME_REASONING_EFFORT=medium
 REALTIME_IDLE_TIMEOUT_SECONDS=45
 REALTIME_MAX_SESSION_SECONDS=300

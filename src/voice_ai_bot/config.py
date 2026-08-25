@@ -202,7 +202,7 @@ class Config:
                 "TTS_INSTRUCTIONS",
                 "Speak naturally. Match the user's language. Keep the response clear and comfortable to listen to.",
             ),
-            realtime_model=os.getenv("REALTIME_MODEL", "gpt-realtime-2"),
+            realtime_model=os.getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
             realtime_reasoning_effort=os.getenv("REALTIME_REASONING_EFFORT", "medium"),
             realtime_voice=os.getenv("REALTIME_VOICE", "marin"),
             realtime_input_rate=realtime_input_rate,

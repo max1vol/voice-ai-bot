@@ -129,7 +129,7 @@ def _config(tmp_path: Path) -> Config:
         tts_model="gpt-4o-mini-tts",
         tts_voice="cedar",
         tts_instructions="test",
-        realtime_model="gpt-realtime-2",
+        realtime_model="gpt-realtime-2.1",
         realtime_reasoning_effort="low",
         realtime_voice="marin",
         realtime_input_rate=24000,

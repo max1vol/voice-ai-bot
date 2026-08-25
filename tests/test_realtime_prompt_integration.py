@@ -417,7 +417,7 @@ def integration_config(tmp_path: Path) -> Config:
         tts_model="gpt-4o-mini-tts",
         tts_voice="cedar",
         tts_instructions="test",
-        realtime_model=os.getenv("REALTIME_MODEL", "gpt-realtime-2"),
+        realtime_model=os.getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
         realtime_reasoning_effort="medium",
         realtime_voice="marin",
         realtime_input_rate=24000,
